@@ -26,8 +26,6 @@ GNU General Public License for more details.
 #include "TextIO.h"
 #include <Psapi.h> // for GetModuleBaseName.
 
-#undef _WIN32_WINNT // v1.1.10.01: Redefine this just for these APIs, to avoid breaking some other commands on Win XP (such as Process Close).
-#define _WIN32_WINNT 0x0600 // Windows Vista
 #include <mmdeviceapi.h> // for SoundSet/SoundGet.
 #pragma warning(push)
 #pragma warning(disable:4091) // Work around a bug in the SDK used by the v140_xp toolset.
@@ -882,12 +880,36 @@ ResultType Line::TrayTip(LPTSTR aTitle, LPTSTR aText, LPTSTR aTimeout, LPTSTR aO
 	if (!g_os.IsWin2000orLater()) // Older OSes do not support it, so do nothing.
 		return OK;
 	NOTIFYICONDATA nic = {0};
-	nic.cbSize = sizeof(nic);
+	if (!g_os.IsWinVistaOrLater()) // No hBalloonIcon support, so use the legacy (Win2k) cbSize.
+		nic.cbSize = NOTIFYICONDATA_V2_SIZE;
+	else
+		nic.cbSize = sizeof(nic);
 	nic.uID = AHK_NOTIFYICON;  // This must match our tray icon's uID or Shell_NotifyIcon() will return failure.
 	nic.hWnd = g_hWnd;
 	nic.uFlags = NIF_INFO;
 	nic.uTimeout = ATOI(aTimeout) * 1000;
 	nic.dwInfoFlags = ATOI(aOptions);
+	DWORD iicon = nic.dwInfoFlags & 0xF;
+	if (iicon == 0 || iicon == NIIF_USER)
+	{
+		if (g_os.MajorVersion() >= 10)
+		{
+			// Windows 10 always shows a large icon, but by default will show an upscaled
+			// version of a (possibly downscaled version of) the main icon, not necessarily
+			// the tray icon.  Set this so that we can give it a better icon, but leave
+			// iicon as is so that the main icon will be used if appropriate.
+			nic.dwInfoFlags |= NIIF_LARGE_ICON | NIIF_USER;
+		}
+		if (nic.dwInfoFlags & NIIF_LARGE_ICON)
+		{
+			// Set the large icon.  If this isn't done, the existing small tray icon will be
+			// used even though we don't set it this time around.  This won't actually be
+			// used unless NIIF_USER is set by the user or the Windows 10 check above.
+			// For backward-compatibility, use the main icon (not tray icon) if this is
+			// Windows 10 and the user didn't specify NIIF_USER.
+			nic.hBalloonIcon = (g_script.mCustomIcon && iicon == NIIF_USER) ? g_script.mCustomIcon : g_IconLarge;
+		}
+	}
 	tcslcpy(nic.szInfoTitle, aTitle, _countof(nic.szInfoTitle)); // Empty title omits the title line entirely.
 	tcslcpy(nic.szInfo, aText, _countof(nic.szInfo));	// Empty text removes the balloon.
 	Shell_NotifyIcon(NIM_MODIFY, &nic);

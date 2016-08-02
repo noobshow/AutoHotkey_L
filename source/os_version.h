@@ -89,6 +89,8 @@ public:
 	bool	IsWinNT4orLater(void) {return true;}
 #endif
 
+	DWORD	MajorVersion() {return m_dwMajorVersion;}
+	DWORD	MinorVersion() {return m_dwMinorVersion;}
 	DWORD	BuildNumber(void) {return m_dwBuildNumber;}
 	//LPCTSTR CSD(void) {return m_szCSDVersion;}
 	LPCTSTR Version() {return m_szVersion;}
