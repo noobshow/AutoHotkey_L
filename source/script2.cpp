@@ -3174,7 +3174,10 @@ ResultType Line::ScriptProcess(LPTSTR aCmd, LPTSTR aProcess, LPTSTR aParam3)
 	case PROCESS_CMD_CLOSE:
 		if (pid = ProcessExist(aProcess))  // Assign
 		{
-			if (hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid))
+			// This previously used PROCESS_ALL_ACCESS, but with NTDDI_VERSION >= NTDDI_VISTA
+			// it includes some flags that make it incompatible with XP.  PROCESS_TERMINATE is
+			// really all we need anyway:
+			if (hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid))
 			{
 				result = TerminateProcess(hProcess, 0);
 				CloseHandle(hProcess);
