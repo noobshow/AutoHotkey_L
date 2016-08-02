@@ -54,6 +54,7 @@ GNU General Public License for more details.
 	#include <malloc.h> // For _alloca()
 	//#include <memory.h>
 
+#pragma warning(disable:4091) // Work around a bug in the v7.1A SDK (shlobj.h).
 	#include <windows.h>
 	#include <tchar.h>
 	#include <commctrl.h> // for status bar functions. Must be included after <windows.h>.
