@@ -393,11 +393,33 @@ BIF_DECL(BIF_ComObjTypeOrValue)
 			aResultToken.symbol = SYM_STRING; // for all code paths below
 			aResultToken.marker = _T(""); // in case of error
 
-			ITypeInfo *ptinfo;
-			if (VT_DISPATCH == obj->mVarType && obj->mDispatch
-				&& SUCCEEDED(obj->mDispatch->GetTypeInfo(0, LOCALE_USER_DEFAULT, &ptinfo)))
+			LPTSTR requested_info = TokenToString(*aParam[1]);
+
+			ITypeInfo *ptinfo = NULL;
+			if (tolower(*requested_info) == 'c')
 			{
-				LPTSTR requested_info = TokenToString(*aParam[1]);
+				// Get class information.
+				if ((VT_DISPATCH == obj->mVarType || VT_UNKNOWN == obj->mVarType) && obj->mUnknown)
+				{
+					ptinfo = GetClassTypeInfo(obj->mUnknown);
+					if (ptinfo)
+					{
+						if (!_tcsicmp(requested_info, _T("class")))
+							requested_info = _T("name");
+						else if (!_tcsicmp(requested_info, _T("clsid")))
+							requested_info = _T("iid");
+					}
+				}
+			}
+			else
+			{
+				// Get IDispatch information.
+				if (VT_DISPATCH == obj->mVarType && obj->mDispatch)
+					if (FAILED(obj->mDispatch->GetTypeInfo(0, LOCALE_USER_DEFAULT, &ptinfo)))
+						ptinfo = NULL;
+			}
+			if (ptinfo)
+			{
 				if (!_tcsicmp(requested_info, _T("name")))
 				{
 					BSTR name;
@@ -728,7 +750,7 @@ void AssignVariant(Var &aArg, VARIANT &aVar, bool aRetainVar = true)
 void TokenToVariant(ExprTokenType &aToken, VARIANT &aVar, BOOL aVarIsArg)
 {
 	if (aToken.symbol == SYM_VAR)
-		aToken.var->TokenToContents(aToken);
+		aToken.var->ToToken(aToken);
 
 	switch(aToken.symbol)
 	{
@@ -933,7 +955,8 @@ void ComError(HRESULT hr, LPTSTR name, EXCEPINFO* pei)
 			size += FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, hr, 0, buf + size, _countof(buf) - size, NULL);
 			if (buf[size-1] == '\n')
 				buf[--size] = '\0';
-				// probably also has '\r', but doesn't seem necessary to remove it.
+			if (buf[size-1] == '\r')
+				buf[--size] = '\0';
 			if (pei)
 				_vsntprintf(buf + size, _countof(buf) - size, _T("\nSource:\t\t%ws\nDescription:\t%ws\nHelpFile:\t\t%ws\nHelpContext:\t%d"), (va_list) &pei->bstrSource);
 			error_text = buf;
@@ -1347,6 +1370,32 @@ ResultType ComObject::SafeArrayInvoke(ExprTokenType &aResultToken, int aFlags, E
 }
 
 
+LPTSTR ComObject::Type()
+{
+	if (mVarType & VT_ARRAY)
+		return _T("ComObjArray"); // Has SafeArray methods.
+	if (mVarType & VT_BYREF)
+		return _T("ComObjRef"); // Has this[].
+	if ((mVarType == VT_DISPATCH || mVarType == VT_UNKNOWN) && mUnknown)
+	{
+		BSTR name;
+		ITypeInfo *ptinfo;
+		// Use COM class name if available.
+		if (  (ptinfo = GetClassTypeInfo(mUnknown))
+			&& SUCCEEDED(ptinfo->GetDocumentation(MEMBERID_NIL, &name, NULL, NULL, NULL))  )
+		{
+			static TCHAR sBuf[64]; // Seems generous enough.
+			tcslcpy(sBuf, CStringTCharFromWCharIfNeeded(name), _countof(sBuf));
+			SysFreeString(name);
+			return sBuf;
+		}
+		if (mVarType == VT_DISPATCH)
+			return _T("ComObject"); // Can be invoked.
+	}
+	return _T("ComObj"); // Can't be invoked; may represent a value or a non-dispatch object.
+}
+
+
 int ComEnum::Next(Var *aOutput, Var *aOutputType)
 {
 	VARIANT varResult = {0};
@@ -1598,6 +1647,8 @@ STDMETHODIMP IObjectComCompatible::Invoke(DISPID dispIdMember, REFIID riid, LCID
 	this_token.object = this;
 
 	HRESULT result_to_return;
+	int outer_excptmode = g->ExcptMode;
+	g->ExcptMode |= EXCPTMODE_CATCH; // Indicate exceptions will be handled (by our caller, the COM client).
 
 	for (;;)
 	{
@@ -1648,6 +1699,8 @@ STDMETHODIMP IObjectComCompatible::Invoke(DISPID dispIdMember, REFIID riid, LCID
 		break;
 	}
 
+	g->ExcptMode = outer_excptmode;
+
 	if (result_token.symbol == SYM_OBJECT)
 		result_token.object->Release();
 	if (result_token.mem_to_free)
@@ -1696,8 +1749,8 @@ void ComObject::DebugWriteProperty(IDebugProperties *aDebugger, int aPage, int a
 	{
 		// For simplicity, assume they all fit within aPageSize.
 		
-		aDebugger->WriteProperty("Value", mVal64);
-		aDebugger->WriteProperty("VarType", mVarType);
+		aDebugger->WriteProperty("Value", ExprTokenType(mVal64));
+		aDebugger->WriteProperty("VarType", ExprTokenType((__int64)mVarType));
 
 		if (mVarType == VT_DISPATCH)
 		{
@@ -1711,14 +1764,14 @@ void ComObject::DebugWriteProperty(IDebugProperties *aDebugger, int aPage, int a
 			aDebugger->BeginProperty("EventSink", "object", 2, sinkCookie);
 			
 			if (mEventSink->mAhkObject)
-				aDebugger->WriteProperty("Object", mEventSink->mAhkObject);
+				aDebugger->WriteProperty("Object", ExprTokenType(mEventSink->mAhkObject));
 			else
-				aDebugger->WriteProperty("Prefix", mEventSink->mPrefix);
+				aDebugger->WriteProperty("Prefix", ExprTokenType(mEventSink->mPrefix));
 			
 			OLECHAR buf[40];
 			if (!StringFromGUID2(mEventSink->mIID, buf, _countof(buf)))
 				*buf = 0;
-			aDebugger->WriteProperty("IID", (LPTSTR)(LPCTSTR)CStringTCharFromWCharIfNeeded(buf));
+			aDebugger->WriteProperty("IID", ExprTokenType((LPTSTR)(LPCTSTR)CStringTCharFromWCharIfNeeded(buf)));
 			
 			aDebugger->EndProperty(sinkCookie);
 		}

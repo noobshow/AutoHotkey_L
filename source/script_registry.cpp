@@ -35,7 +35,8 @@ ResultType Line::IniRead(LPTSTR aFilespec, LPTSTR aSection, LPTSTR aKey, LPTSTR 
 		aDefault = _T("ERROR");  // This mirrors what AutoIt2 does for its default value.
 	TCHAR	szFileTemp[_MAX_PATH+1];
 	TCHAR	*szFilePart, *cp;
-	TCHAR	szBuffer[65535] = _T("");					// Max ini file size is 65535 under 95
+	TCHAR	szBuffer[65535];					// Max ini file size is 65535 under 95
+	*szBuffer = '\0';
 	TCHAR	szEmpty[] = _T("");
 	// Get the fullpathname (ini functions need a full path):
 	GetFullPathName(aFilespec, _MAX_PATH, szFileTemp, &szFilePart);
@@ -570,3 +571,40 @@ ResultType Line::RegDelete(HKEY aRootKey, LPTSTR aRegSubkey, LPTSTR aValueName)
 finish:
 	return SetErrorsOrThrow(result != ERROR_SUCCESS, result);
 } // RegDelete()
+
+
+
+struct RegRootKeyType
+{
+	LPTSTR short_name;
+	LPTSTR long_name;
+	HKEY key;
+};
+
+static RegRootKeyType sRegRootKeyTypes[] =
+{
+	{_T("HKLM"), _T("HKEY_LOCAL_MACHINE"), HKEY_LOCAL_MACHINE},
+	{_T("HKCR"), _T("HKEY_CLASSES_ROOT"), HKEY_CLASSES_ROOT},
+	{_T("HKCC"), _T("HKEY_CURRENT_CONFIG"), HKEY_CURRENT_CONFIG},
+	{_T("HKCU"), _T("HKEY_CURRENT_USER"), HKEY_CURRENT_USER},
+	{_T("HKU"), _T("HKEY_USERS"), HKEY_USERS}
+};
+
+HKEY Line::RegConvertRootKeyType(LPTSTR aName)
+{
+	for (int i = 0; i < _countof(sRegRootKeyTypes); ++i)
+		if (!_tcsicmp(aName, sRegRootKeyTypes[i].short_name)
+			|| !_tcsicmp(aName, sRegRootKeyTypes[i].long_name))
+			return sRegRootKeyTypes[i].key;
+	return NULL;
+}
+
+LPTSTR Line::RegConvertRootKeyType(HKEY aKey)
+{
+	for (int i = 0; i < _countof(sRegRootKeyTypes); ++i)
+		if (aKey == sRegRootKeyTypes[i].key)
+			return sRegRootKeyTypes[i].long_name;
+	// These are either unused or so rarely used (DYN_DATA on Win9x) that they aren't supported:
+	// HKEY_PERFORMANCE_DATA, HKEY_PERFORMANCE_TEXT, HKEY_PERFORMANCE_NLSTEXT, HKEY_DYN_DATA
+	return _T("");
+}

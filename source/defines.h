@@ -33,7 +33,7 @@ GNU General Public License for more details.
 
 #define AHK_NAME "AutoHotkey"
 #include "ahkversion.h"
-#define AHK_WEBSITE "http://ahkscript.org"
+#define AHK_WEBSITE "https://autohotkey.com"
 
 #define T_AHK_NAME			_T(AHK_NAME)
 #define T_AHK_VERSION		_T(AHK_VERSION)
@@ -103,6 +103,11 @@ enum ResultType {FAIL = 0, OK, WARN = OK, CRITICAL_ERROR  // Some things might r
 	, LOOP_BREAK, LOOP_CONTINUE
 	, EARLY_RETURN, EARLY_EXIT}; // EARLY_EXIT needs to be distinct from FAIL for ExitApp() and AutoExecSection().
 
+enum ExcptModeType {EXCPTMODE_NONE = 0
+	, EXCPTMODE_TRY = 1 // Try block present.  Affects SetErrorLevelOrThrow().
+	, EXCPTMODE_CATCH = 2 // Exception will be suppressed or caught.
+	, EXCPTMODE_DELETE = 4}; // Unhandled exceptions will display ERR_ABORT_DELETE vs. ERR_ABORT.
+
 #define SEND_MODES { _T("Event"), _T("Input"), _T("Play"), _T("InputThenPlay") } // Must match the enum below.
 enum SendModes {SM_EVENT, SM_INPUT, SM_PLAY, SM_INPUT_FALLBACK_TO_PLAY, SM_INVALID}; // SM_EVENT must be zero.
 // In above, SM_INPUT falls back to SM_EVENT when the SendInput mode would be defeated by the presence
@@ -112,12 +117,17 @@ enum SendModes {SM_EVENT, SM_INPUT, SM_PLAY, SM_INPUT_FALLBACK_TO_PLAY, SM_INVAL
 // SM_INPUT_FALLBACK_TO_PLAY falls back to the SendPlay mode.  SendInput has this extra fallback behavior
 // because it's likely to become the most popular sending method.
 
-enum ExitReasons {EXIT_NONE, EXIT_CRITICAL, EXIT_ERROR, EXIT_DESTROY, EXIT_LOGOFF, EXIT_SHUTDOWN
-	, EXIT_WM_QUIT, EXIT_WM_CLOSE, EXIT_MENU, EXIT_EXIT, EXIT_RELOAD, EXIT_SINGLEINSTANCE};
+enum SendRawModes {SCM_NOT_RAW = FALSE, SCM_RAW, SCM_RAW_TEXT};
+typedef UCHAR SendRawType;
 
-enum WarnType {WARN_USE_UNSET_LOCAL, WARN_USE_UNSET_GLOBAL, WARN_LOCAL_SAME_AS_GLOBAL, WARN_USE_ENV, WARN_ALL};
+enum ExitReasons {EXIT_NONE, EXIT_ERROR, EXIT_DESTROY, EXIT_LOGOFF, EXIT_SHUTDOWN
+	, EXIT_CLOSE, EXIT_MENU, EXIT_EXIT, EXIT_RELOAD, EXIT_SINGLEINSTANCE};
+
+enum WarnType {WARN_USE_UNSET_LOCAL, WARN_USE_UNSET_GLOBAL, WARN_LOCAL_SAME_AS_GLOBAL, WARN_USE_ENV, WARN_CLASS_OVERWRITE, WARN_ALL};
+#define WARN_TYPE_STRINGS _T("UseUnsetLocal"), _T("UseUnsetGlobal"), _T("LocalSameAsGlobal"), _T("UseEnv"), _T("ClassOverwrite"), _T("All")
 
 enum WarnMode {WARNMODE_OFF, WARNMODE_OUTPUTDEBUG, WARNMODE_MSGBOX, WARNMODE_STDOUT};	// WARNMODE_OFF must be zero.
+#define WARN_MODE_STRINGS _T("Off"), _T("OutputDebug"), _T("MsgBox"), _T("StdOut")
 
 enum SingleInstanceType {ALLOW_MULTI_INSTANCE, SINGLE_INSTANCE_PROMPT, SINGLE_INSTANCE_REPLACE
 	, SINGLE_INSTANCE_IGNORE, SINGLE_INSTANCE_OFF}; // ALLOW_MULTI_INSTANCE must be zero.
@@ -204,6 +214,9 @@ struct DECLSPEC_NOVTABLE IObject // L31: Abstract interface for "objects".
 {
 	// See script_object.cpp for comments.
 	virtual ResultType STDMETHODCALLTYPE Invoke(ExprTokenType &aResultToken, ExprTokenType &aThisToken, int aFlags, ExprTokenType *aParam[], int aParamCount) = 0;
+	virtual LPTSTR Type() = 0;
+	#define IObject_Type_Impl(name) \
+		LPTSTR Type() { return _T(name); }
 	
 #ifdef CONFIG_DEBUGGER
 	virtual void DebugWriteProperty(IDebugProperties *, int aPage, int aPageSize, int aMaxDepth) = 0;
@@ -231,12 +244,8 @@ struct DECLSPEC_NOVTABLE IDebugProperties
 {
 	// For simplicity/code size, the debugger handles failures internally
 	// rather than returning an error code and requiring caller to handle it.
-	virtual void WriteProperty(LPCSTR aName, LPTSTR aValue) = 0;
-	virtual void WriteProperty(LPCSTR aName, __int64 aValue) = 0;
-	virtual void WriteProperty(LPCSTR aName, IObject *aValue) = 0;
 	virtual void WriteProperty(LPCSTR aName, ExprTokenType &aValue) = 0;
-	virtual void WriteProperty(INT_PTR aKey, ExprTokenType &aValue) = 0;
-	virtual void WriteProperty(IObject *aKey, ExprTokenType &aValue) = 0;
+	virtual void WriteProperty(ExprTokenType &aKey, ExprTokenType &aValue) = 0;
 	virtual void BeginProperty(LPCSTR aName, LPCSTR aType, int aNumChildren, DebugCookie &aCookie) = 0;
 	virtual void EndProperty(DebugCookie aCookie) = 0;
 };
@@ -280,7 +289,7 @@ struct ExprTokenType  // Something in the compiler hates the name TokenType, so 
 			union // These nested structs and unions minimize the token size by overlapping data.
 			{
 				IObject *object;
-				DerefType *deref; // for SYM_FUNC
+				DerefType *deref; // for SYM_FUNC, and (while parsing) SYM_ASSIGN etc.
 				Var *var;         // for SYM_VAR
 				LPTSTR marker;     // for SYM_STRING and SYM_OPERAND.
 			};
@@ -288,6 +297,7 @@ struct ExprTokenType  // Something in the compiler hates the name TokenType, so 
 			{
 				LPTSTR buf;
 				size_t marker_length; // Used only with aResultToken. TODO: Move into separate ResultTokenType struct.
+				BOOL is_lvalue;   // for SYM_VAR
 			};
 		};  
 	};
@@ -336,6 +346,17 @@ struct ExprTokenType  // Something in the compiler hates the name TokenType, so 
 		ASSERT(aValue);
 		symbol = SYM_OBJECT;
 		object = aValue;
+	}
+
+	inline void CopyValueFrom(ExprTokenType &other)
+	// Copies the value of a token (by reference where applicable).  Does not object->AddRef().
+	{
+		value_int64 = other.value_int64; // Union copy.
+#ifdef _WIN64
+		// For simplicity/smaller code size, don't bother checking symbol == SYM_STRING.
+		buf = other.buf; // Already covered by the above on x86.
+#endif
+		symbol = other.symbol;
 	}
 };
 #define MAX_TOKENS 512 // Max number of operators/operands.  Seems enough to handle anything realistic, while conserving call-stack space.
@@ -663,14 +684,31 @@ const SendLevelType SendLevelMax = 100;
 inline bool SendLevelIsValid(int level) { return level >= 0 && level <= SendLevelMax; }
 
 
-// Same reason as above struct.  It's best to keep this struct as small as possible
-// because it's used as a local (stack) var by at least one recursive function:
+class Line; // Forward declaration.
+typedef UCHAR HotCriterionType;
+enum HotCriterionEnum {HOT_NO_CRITERION, HOT_IF_ACTIVE, HOT_IF_NOT_ACTIVE, HOT_IF_EXIST, HOT_IF_NOT_EXIST // HOT_NO_CRITERION must be zero.
+	, HOT_IF_EXPR, HOT_IF_CALLBACK}; // Keep the last two in this order for the macro below.
+#define HOT_IF_REQUIRES_EVAL(type) ((type) >= HOT_IF_EXPR)
+struct HotkeyCriterion
+{
+	HotCriterionType Type;
+	LPTSTR WinTitle, WinText;
+	union
+	{
+		Line *ExprLine;
+		IObject *Callback;
+	};
+	HotkeyCriterion *NextCriterion;
+
+	ResultType Eval(LPTSTR aHotkeyName); // For HOT_IF_EXPR and HOT_IF_CALLBACK.
+};
+
+
 // Each instance of this struct generally corresponds to a quasi-thread.  The function that creates
 // a new thread typically saves the old thread's struct values on its stack so that they can later
 // be copied back into the g struct when the thread is resumed:
 class Func;                 // Forward declarations
 class Label;                //
-class Line;                 //
 struct RegItemStruct;       //
 struct LoopReadFileStruct;  //
 class GuiType;				//
@@ -744,9 +782,9 @@ struct global_struct
 	bool IsPaused; // The latter supports better toggling via "Pause" or "Pause Toggle".
 	bool ListLinesIsEnabled;
 	UINT Encoding;
+	int ExcptMode;
 	ExprTokenType* ThrownToken;
-	Line* ExcptLine;
-	bool InTryBlock;
+	inline bool InTryBlock() { return ExcptMode & EXCPTMODE_TRY; }
 };
 
 inline void global_maximize_interruptibility(global_struct &g)
@@ -785,7 +823,7 @@ inline void global_clear_state(global_struct &g)
 	g.mLoopReadFile = NULL;
 	g.mLoopField = NULL;
 	g.ThrownToken = NULL;
-	g.InTryBlock = false;
+	g.ExcptMode = EXCPTMODE_NONE;
 }
 
 inline void global_init(global_struct &g)

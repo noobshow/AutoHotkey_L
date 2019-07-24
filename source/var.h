@@ -61,9 +61,18 @@ class Var; // Forward declaration.
 // across two 8-byte regions in memory).
 struct VarBkp // This should be kept in sync with any changes to the Var class.  See Var for comments.
 {
-	__int64 mContentsInt64; // 64-bit members kept at the top of the struct to reduce the chance that they'll span 2 vs. 1 64-bit regions.
+	union
+	{
+		__int64 mContentsInt64; // 64-bit members kept at the top of the struct to reduce the chance that they'll span 2 vs. 1 64-bit regions.
+		double mContentsDouble;
+		IObject *mObject;
+	};
 	Var *mVar; // Used to save the target var to which these backed up contents will later be restored.
-	char *mByteContents;
+	union
+	{
+		char *mByteContents;
+		TCHAR *mCharContents;
+	};
 	union
 	{
 		VarSizeType mByteLength;
@@ -76,6 +85,8 @@ struct VarBkp // This should be kept in sync with any changes to the Var class. 
 	// Not needed in the backup:
 	//bool mIsLocal;
 	//TCHAR *mName;
+
+	void ToToken(ExprTokenType &aValue);
 };
 
 #pragma warning(push)
@@ -148,6 +159,7 @@ private:
 	VarAttribType mAttrib;  // Bitwise combination of the above flags.
 	#define VAR_GLOBAL			0x01
 	#define VAR_LOCAL			0x02
+	#define VAR_FORCE_LOCAL		0x04 // Flag reserved for force-local mode in functions (not used in Var::mScope).
 	#define VAR_LOCAL_FUNCPARAM	0x10 // Indicates this local var is a function's parameter.  VAR_LOCAL_DECLARED should also be set.
 	#define VAR_LOCAL_STATIC	0x20 // Indicates this local var retains its value between function calls.
 	#define VAR_DECLARED		0x40 // Indicates this var was declared somehow, not automatic.
@@ -480,7 +492,7 @@ public:
 		return OK; // Since above didn't return, indicate success.
 	}
 
-	void TokenToContents(ExprTokenType &aToken) // L31: Mostly for object support.
+	void ToTokenSkipAddRef(ExprTokenType &aToken)
 	// See ToDoubleOrInt64 for comments.
 	{
 		Var &var = *(mType == VAR_ALIAS ? mAliasFor : this);
@@ -501,13 +513,19 @@ public:
 			{
 				aToken.symbol = SYM_OBJECT;
 				aToken.object = var.mObject;
-				aToken.object->AddRef();
 				return;
 			}
 			//else contains a regular string.
 			aToken.symbol = SYM_STRING;
 			aToken.marker = var.Contents();
 		}
+	}
+
+	void ToToken(ExprTokenType &aToken)
+	{
+		ToTokenSkipAddRef(aToken);
+		if (aToken.symbol == SYM_OBJECT)
+			aToken.object->AddRef();
 	}
 
 	// Not an enum so that it can be global more easily:
@@ -531,7 +549,7 @@ public:
 	#define DISPLAY_FUNC_ERROR 2
 	static ResultType ValidateName(LPCTSTR aName, int aDisplayError = DISPLAY_VAR_ERROR);
 
-	LPTSTR ObjectToText(LPTSTR aBuf, int aBufSize);
+	LPTSTR ObjectToText(LPTSTR aName, LPTSTR aBuf, int aBufSize);
 	LPTSTR ToText(LPTSTR aBuf, int aBufSize, bool aAppendNewline)
 	// Caller must ensure that Type() == VAR_NORMAL.
 	// aBufSize is an int so that any negative values passed in from caller are not lost.
@@ -546,7 +564,7 @@ public:
 		var.UpdateContents(); // Update mContents and mLength for use below.
 		LPTSTR aBuf_orig = aBuf;
 		if (var.IsObject())
-			aBuf = ObjectToText(aBuf, aBufSize);
+			aBuf = var.ObjectToText(this->mName, aBuf, aBufSize);
 		else
 			aBuf += sntprintf(aBuf, BUF_SPACE_REMAINING, _T("%s[%Iu of %Iu]: %-1.60s%s"), mName // mName not var.mName (see comment above).
 				, var._CharLength(), var._CharCapacity() ? (var._CharCapacity() - 1) : 0  // Use -1 since it makes more sense to exclude the terminator.

@@ -27,21 +27,29 @@ static HANDLE sMouseMutex = NULL;
 #define KEYBD_MUTEX_NAME _T("AHK Keybd")
 #define MOUSE_MUTEX_NAME _T("AHK Mouse")
 
+// It's done the following way because:
+// It's unclear that zero is always an invalid thread ID (not even GetWindowThreadProcessId's
+// documentation gives any hint), so its safer to assume that a thread ID can be zero and yet still valid.
+static HANDLE sThreadHandle = NULL;
+
 // Whether to disguise the next up-event for lwin/rwin to suppress Start Menu.
+// There is only one variable because even if multiple modifiers are pressed
+// simultaneously and they do not cancel each other out, disguising one will
+// have the effect of disguising all (with the exception that key-repeat can
+// reset LWin/RWin after the other modifier is released, so this variable
+// should not be reset until all Win keys are released).
 // These are made global, rather than static inside the hook function, so that
 // we can ensure they are initialized by the keyboard init function every
 // time it's called (currently it can be only called once):
-static bool sDisguiseNextLWinUp;        // Initialized by ResetHook().
-static bool sDisguiseNextRWinUp;        //
-static bool sDisguiseNextLAltUp;        //
-static bool sDisguiseNextRAltUp;        //
+static bool sDisguiseNextMenu;          // Initialized by ResetHook().
+static bool sUndisguisedMenuInEffect;	//
 static bool sAltTabMenuIsVisible;       //
 
 // The prefix key that's currently down (i.e. in effect).
 // It's tracked this way, rather than as a count of the number of prefixes currently down, out of
 // concern that such a count might accidentally wind up above zero (due to a key-up being missed somehow)
 // and never come back down, thus penalizing performance until the program is restarted:
-static key_type *pPrefixKey;  // Initialized by ResetHook().
+key_type *pPrefixKey;  // Initialized by ResetHook().
 
 // Less memory overhead (space and performance) to allocate a solid block for multidimensional arrays:
 // These store all the valid modifier+suffix combinations (those that result in hotkey actions) except
@@ -128,6 +136,8 @@ enum DualNumpadKeys	{PAD_DECIMAL, PAD_NUMPAD0, PAD_NUMPAD1, PAD_NUMPAD2, PAD_NUM
 , PAD_RIGHT, PAD_HOME, PAD_UP, PAD_PRIOR, PAD_TOTAL_COUNT};
 static bool sPadState[PAD_TOTAL_COUNT];  // Initialized by ChangeHookState()
 
+static bool sHookSyncd; // Only valid while in WaitHookIdle().
+
 /////////////////////////////////////////////////////////////////////////////////////////////
 
 /*
@@ -167,6 +177,8 @@ LRESULT CALLBACK LowLevelKeybdProc(int aCode, WPARAM wParam, LPARAM lParam)
 	// purpose of updating modifier and key states:
 	if (event.dwExtraInfo == KEY_PHYS_IGNORE)
 		event.flags &= ~LLKHF_INJECTED;
+	else if (event.dwExtraInfo == KEY_BLOCK_THIS)
+		return TRUE;
 
 	// Make all keybd events physical to try to fool the system into accepting CTRL-ALT-DELETE.
 	// This didn't work, which implies that Ctrl-Alt-Delete is trapped at a lower level than
@@ -300,7 +312,7 @@ LRESULT CALLBACK LowLevelMouseProc(int aCode, WPARAM wParam, LPARAM lParam)
 	//event.flags &= ~LLMHF_INJECTED;
 
 	if (!(event.flags & LLMHF_INJECTED)) // Physical mouse movement or button action (uses LLMHF vs. LLKHF).
-		g_TimeLastInputPhysical = GetTickCount();
+		g_TimeLastInputPhysical = g_TimeLastInputMouse = GetTickCount();
 		// Above: Don't use event.time, mostly because SendInput can produce invalid timestamps on such events
 		// (though in truth, that concern isn't valid because SendInput's input isn't marked as physical).
 		// Another concern is the comments at the other update of "g_TimeLastInputPhysical" elsewhere in this file.
@@ -628,54 +640,7 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 		// this_key.no_suppress &= ~NO_SUPPRESS_NEXT_UP_EVENT;
 	}
 
-	if (aHook == g_KeybdHook)
-	{
-		// The below DISGUISE events are done only after ignored events are returned from, above.
-		// In other words, only non-ignored events (usually physical) are disguised.  The Send {Blind}
-		// method is designed with this in mind, since it's more concerned that simulated keystrokes
-		// don't get disguised (i.e. it seems best to disguise physical keystrokes even during {Blind} mode).
-		// Do this only after the above because the SuppressThisKey macro relies
-		// on the vk variable being available.  It also relies upon the fact that sc has
-		// already been properly determined. Also, in rare cases it may be necessary to disguise
-		// both left and right, which is why it's not done as a generic windows key:
-		if (   aKeyUp && ((sDisguiseNextLWinUp && aVK == VK_LWIN) || (sDisguiseNextRWinUp && aVK == VK_RWIN)
-			|| (sDisguiseNextLAltUp && aVK == VK_LMENU) || (sDisguiseNextRAltUp && aVK == VK_RMENU))   )
-		{
-			// Do this first to avoid problems with reentrancy triggered by the KeyEvent() calls further below.
-			switch (aVK)
-			{
-			case VK_LWIN: sDisguiseNextLWinUp = false; break;
-			case VK_RWIN: sDisguiseNextRWinUp = false; break;
-			// UPDATE: The comment below is no longer a concern since neutral keys are translated higher above
-			// into their left/right-specific counterpart:
-			// For now, assume VK_MENU the left alt key.  This neutral key is probably never received anyway
-			// due to the nature of this type of hook on NT/2k/XP and beyond.  Later, this can be further
-			// optimized to check the scan code and such (what's being done here isn't that essential to
-			// start with, so it's not a high priority -- but when it is done, be sure to review the
-			// above IF statement also).
-			case VK_LMENU: sDisguiseNextLAltUp = false; break;
-			case VK_RMENU: sDisguiseNextRAltUp = false; break;
-			}
-			// Send our own up-event to replace this one.  But since ours has the Shift key
-			// held down for it, the Start Menu or foreground window's menu bar won't be invoked.
-			// It's necessary to send an up-event so that it's state, as seen by the system,
-			// is put back into the up position, which would be needed if its previous
-			// down-event wasn't suppressed (probably due to the fact that this win or alt
-			// key is a prefix but not a suffix).
-			// Fix for v1.0.25: Use CTRL vs. Shift to avoid triggering the LAlt+Shift language-change hotkey.
-			// This is definitely needed for ALT, but is done here for WIN also in case ALT is down,
-			// which might cause the use of SHIFT as the disguise key to trigger the language switch.
-			if (!(g_modifiersLR_logical & (MOD_LCONTROL | MOD_RCONTROL))) // Neither CTRL key is down.
-				KeyEvent(KEYDOWNANDUP, g_MenuMaskKey);
-			// Since the above call to KeyEvent() calls the keybd hook recursively, a quick down-and-up
-			// on Control is all that is necessary to disguise the key.  This is because the OS will see
-			// that the Control keystroke occurred while ALT or WIN is still down because we haven't
-			// done CallNextHookEx() yet.
-			// Fix for v1.0.36.07: Don't return here because this release might also be a hotkey such as
-			// "~LWin Up::".
-		}
-	}
-	else // Mouse hook
+	if (aHook == g_MouseHook)
 	{
 		// If no vk, there's no mapping for this key, so currently there's no way to process it.
 		if (!aVK)
@@ -744,8 +709,17 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 	//if (!vk && !sc)
 	//	return AllowKeyToGoToSystem;
 
+	
+
 	if (!this_key.used_as_prefix && !this_key.used_as_suffix)
+	{
+		// Fix for v1.1.31.02: This is done regardless of used_as to ensure it doesn't get "stuck down"
+		// when a custom combination hotkey Suspends itself, thereby causing used_as to be reset to false.
+		// Fix for v1.1.31.03: Done conditionally because its previous value is used below.  This affects
+		// modifier keys as hotkeys, such as Shift::MsgBox.
+		this_key.is_down = !aKeyUp;
 		return AllowKeyToGoToSystem;
+	}
 
 	HotkeyIDType hotkey_id_with_flags = HOTKEY_ID_INVALID; // Set default.
 	HotkeyVariant *firing_is_certain = NULL;               //
@@ -802,6 +776,17 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 	modLR_type modifiersLRnew;
 
 	bool this_toggle_key_can_be_toggled = this_key.pForceToggle && *this_key.pForceToggle == NEUTRAL; // Relies on short-circuit boolean order.
+
+	// Prior to considering whether to fire a hotkey, correct the hook's modifier state.
+	// Although this is rarely needed, there are times when the OS disables the hook, thus
+	// it is possible for it to miss keystrokes.  This should be done before pPrefixKey is
+	// consulted below as pPrefixKey itself might be corrected if it is a standard modifier.
+	// See comments in GetModifierLRState() for more info:
+	if (!modifiers_were_corrected)
+	{
+		modifiers_were_corrected = true;
+		GetModifierLRState(true);
+	}
 
 	///////////////////////////////////////////////////////////////////////////////////////
 	// CASE #1 of 4: PREFIX key has been pressed down.  But use it in this capacity only if
@@ -872,16 +857,6 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 			// fire now rather than waiting for the key-up event.  This is done because it makes sense,
 			// it's more correct, and also it makes the behavior of a hooked ^a hotkey consistent with
 			// that of a registered ^a.
-
-			// Prior to considering whether to fire a hotkey, correct the hook's modifier state.
-			// Although this is rarely needed, there are times when the OS disables the hook, thus
-			// it is possible for it to miss keystrokes.  See comments in GetModifierLRState()
-			// for more info:
-			if (!modifiers_were_corrected)
-			{
-				modifiers_were_corrected = true;
-				GetModifierLRState(true);
-			}
 
 			// non_ignored is always used when considering whether a key combination is in place to
 			// trigger a hotkey:
@@ -1118,8 +1093,7 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 				&& hotkey_id_with_flags == HOTKEY_ID_INVALID) // v1.0.44.04: Must check this because this prefix might be being used in its role as a suffix instead.
 			{
 				if (this_key.as_modifiersLR) // Always false if our caller is the mouse hook.
-					return (this_key.was_just_used == AS_PREFIX_FOR_HOTKEY) ? AllowKeyToGoToSystemButDisguiseWinAlt
-						: AllowKeyToGoToSystem;  // i.e. don't disguise Win or Alt key if it didn't fire a hotkey.
+					return AllowKeyToGoToSystem; // Win/Alt will be disguised if needed.
 				// Otherwise:
 				return (this_key.no_suppress & NO_SUPPRESS_PREFIX) ? AllowKeyToGoToSystem : SuppressThisKey;
 			}
@@ -1172,13 +1146,6 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 	// it fell through from CASE #3 or #2 above).  This case can also happen if it fell through from
 	// case #1 (i.e. it already determined the value of hotkey_id_with_flags).
 	////////////////////////////////////////////////////////////////////////////////////////////////////
-	// First correct modifiers, because at this late a state, the likelihood of firing a hotkey is high.
-	// For details, see comments for "modifiers_were_corrected" above:
-	if (!modifiers_were_corrected && hotkey_id_with_flags == HOTKEY_ID_INVALID)
-	{
-		modifiers_were_corrected = true;
-		GetModifierLRState(true);
-	}
 	bool fire_with_no_suppress = false; // Set default.
 
 	if (pPrefixKey && (!aKeyUp || this_key.used_as_key_up) && hotkey_id_with_flags == HOTKEY_ID_INVALID) // Helps performance by avoiding all the below checking.
@@ -1187,21 +1154,20 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 		// take effect regardless of whether any win/ctrl/alt/shift modifiers are currently down, even if
 		// those modifiers themselves form another valid hotkey with this suffix.  In other words,
 		// ModifierVK/SC combos take precedence over normally-modified combos:
-		int i;
-		vk_type modifier_vk;
-		sc_type modifier_sc;
-		for (i = 0; i < this_key.nModifierVK; ++i)
+		Hotkey *found_hk = NULL;
+		for (hotkey_id_temp = this_key.first_custom_combo; hotkey_id_temp != HOTKEY_ID_INVALID; )
 		{
-			vk_hotkey &this_modifier_vk = this_key.ModifierVK[i]; // For performance and convenience.
+			Hotkey &this_hk = *Hotkey::shk[hotkey_id_temp]; // hotkey_id_temp does not include flags in this case.
+			key_type &this_modifier_key = this_hk.mModifierVK ? kvk[this_hk.mModifierVK] : ksc[this_hk.mModifierSC];
 			// The following check supports the prefix+suffix pairs that have both an up hotkey and a down,
 			// such as:
 			//a & b::     ; Down.
 			//a & b up::  ; Up.
 			//MsgBox %A_ThisHotkey%
 			//return
-			if (kvk[this_modifier_vk.vk].is_down) // A prefix key qualified to trigger this suffix is down.
+			if (this_modifier_key.is_down) // A prefix key qualified to trigger this suffix is down.
 			{
-				if (this_modifier_vk.id_with_flags & HOTKEY_KEY_UP)
+				if (this_hk.mKeyUp)
 				{
 					if (!aKeyUp) // Key-up hotkey but the event is a down-event.
 					{
@@ -1210,15 +1176,14 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 						// thus desirable).  v1.0.41: This is done even if the hotkey is subject
 						// to #IfWin because it seems more correct to check those criteria at the actual time
 						// the key is released rather than now:
-						this_key.hotkey_to_fire_upon_release = this_modifier_vk.id_with_flags;
-						if (hotkey_id_with_flags != HOTKEY_ID_INVALID) // i.e. a previous iteration already found the down-event to fire.
+						this_key.hotkey_to_fire_upon_release = this_hk.mID;
+						if (found_hk) // i.e. a previous iteration already found the down-event to fire.
 							break;
 						//else continue searching for the down hotkey that goes with this up (if any).
 					}
 					else // this hotkey is qualified to fire.
 					{
-						hotkey_id_with_flags = this_modifier_vk.id_with_flags;
-						modifier_vk = this_modifier_vk.vk;
+						found_hk = &this_hk;
 						break;
 					}
 				}
@@ -1226,8 +1191,8 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 				{
 					if (!aKeyUp)
 					{
-						hotkey_id_with_flags = this_modifier_vk.id_with_flags;
-						modifier_vk = this_modifier_vk.vk; // Set this now in case loop ends on its own (not via break).
+						if (!found_hk) // Use the first one found (especially important when both "a & Control" and "a & LControl" are present).
+							found_hk = &this_hk;
 						// and continue searching for the up hotkey (if any) to queue up for firing upon the key's release).
 					}
 					//else this key-down hotkey can't fire because the current event is a up-event.
@@ -1235,181 +1200,38 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 					// generates down-events (e.g. certain Dell keyboards).
 				}
 			} // qualified prefix is down
+			hotkey_id_temp = this_hk.mNextCustomCombo;
 		} // for each prefix of this suffix
-		if (hotkey_id_with_flags != HOTKEY_ID_INVALID)
+		if (found_hk)
 		{
-			// Update pPrefixKey, even though it was probably already done close to the top of the function,
-			// just in case this for-loop changed the value pPrefixKey (perhaps because there
+			// Update pPrefixKey, even though it was probably already done close to the top of the
+			// function, just in case this hotkey uses a different prefix key (perhaps because there
 			// is currently more than one prefix being held down).
 			// Since the hook is now designed to receive only left/right specific modifier keys
 			// -- never the neutral keys -- never indicate that a neutral prefix key is down because
 			// then it would never be released properly by the other main prefix/suffix handling
 			// cases of the hook.  Instead, always identify which prefix key (left or right) is
 			// in effect:
-			switch (modifier_vk)
+			switch (found_hk->mModifierVK)
 			{
 			case VK_SHIFT: pPrefixKey = kvk + (kvk[VK_RSHIFT].is_down ? VK_RSHIFT : VK_LSHIFT); break;
 			case VK_CONTROL: pPrefixKey = kvk + (kvk[VK_RCONTROL].is_down ? VK_RCONTROL : VK_LCONTROL); break;
 			case VK_MENU: pPrefixKey = kvk + (kvk[VK_RMENU].is_down ? VK_RMENU : VK_LMENU); break;
-			default: pPrefixKey = kvk + modifier_vk;
+			case 0: pPrefixKey = ksc + found_hk->mModifierSC; break;
+			default: pPrefixKey = kvk + found_hk->mModifierVK;
 			}
-		}
-		else // Now check scan codes since above didn't find a valid hotkey.
-		{
-			for (i = 0; i < this_key.nModifierSC; ++i)
+			if (found_hk->mHookAction)
+				hotkey_id_with_flags = found_hk->mHookAction;
+			else // Don't call the below for Alt-tab hotkeys and similar.
 			{
-				sc_hotkey &this_modifier_sc = this_key.ModifierSC[i]; // For performance and convenience.
-				if (ksc[this_modifier_sc.sc].is_down)
-				{
-					// See similar section above for comments about the section below:
-					if (this_modifier_sc.id_with_flags & HOTKEY_KEY_UP)
-					{
-						if (!aKeyUp)
-						{
-							this_key.hotkey_to_fire_upon_release = this_modifier_sc.id_with_flags;
-							if (hotkey_id_with_flags != HOTKEY_ID_INVALID) // i.e. a previous iteration already found the down-event to fire.
-								break;
-						}
-						else // this hotkey is qualified to fire.
-						{
-							hotkey_id_with_flags = this_modifier_sc.id_with_flags;
-							modifier_sc = this_modifier_sc.sc;
-							break;
-						}
-					}
-					else // This is a normal hotkey that fires on suffix key-down.
-					{
-						if (!aKeyUp)
-						{
-							hotkey_id_with_flags = this_modifier_sc.id_with_flags;
-							modifier_sc = this_modifier_sc.sc; // Set this now in case loop ends on its own (not via break).
-						}
-					}
-				}
-			} // for()
-			if (hotkey_id_with_flags != HOTKEY_ID_INVALID)
-				// Update pPrefixKey, even though it was probably already done close to the top of the function,
-				// just in case this for-loop changed the value pPrefixKey (perhaps because there
-				// is currently more than one prefix being held down).
-				pPrefixKey = ksc + modifier_sc;
-		} // The check for scan code vs. VK.
-		if (hotkey_id_with_flags == HOTKEY_ID_INVALID)
-		{
-			// Search again, but this time do it with this_key translated into its neutral counterpart.
-			// This avoids the need to display a warning dialog for an example such as the following,
-			// which was previously unsupported:
-			// AppsKey & Control::MsgBox %A_ThisHotkey%
-			// Note: If vk was a neutral modifier when it first came in (e.g. due to NT4), it was already
-			// translated early on (above) to be non-neutral.
-			vk_type vk_neutral = 0;  // Set default.  Note that VK_LWIN/VK_RWIN have no neutral VK.
-			switch (aVK)
-			{
-			case VK_LCONTROL:
-			case VK_RCONTROL: vk_neutral = VK_CONTROL; break;
-			case VK_LMENU:
-			case VK_RMENU:    vk_neutral = VK_MENU; break;
-			case VK_LSHIFT:
-			case VK_RSHIFT:   vk_neutral = VK_SHIFT; break;
-			}
-			if (vk_neutral)
-			{
-				// These next two for() loops are nearly the same as the ones above, so see comments there
-				// and maintain them together:
-				int max = kvk[vk_neutral].nModifierVK;
-				for (i = 0; i < max; ++i)
-				{
-					vk_hotkey &this_modifier_vk = kvk[vk_neutral].ModifierVK[i]; // For performance and convenience.
-					if (kvk[this_modifier_vk.vk].is_down)
-					{
-						// See similar section above for comments about the section below:
-						if (this_modifier_vk.id_with_flags & HOTKEY_KEY_UP)
-						{
-							if (!aKeyUp)
-							{
-								this_key.hotkey_to_fire_upon_release = this_modifier_vk.id_with_flags;
-								if (hotkey_id_with_flags != HOTKEY_ID_INVALID) // i.e. a previous iteration already found the down-event to fire.
-									break;
-							}
-							else // this hotkey is qualified to fire.
-							{
-								hotkey_id_with_flags = this_modifier_vk.id_with_flags;
-								modifier_vk = this_modifier_vk.vk;
-								break;
-							}
-						}
-						else // This is a normal hotkey that fires on suffix key-down.
-						{
-							if (!aKeyUp)
-							{
-								hotkey_id_with_flags = this_modifier_vk.id_with_flags;
-								modifier_vk = this_modifier_vk.vk; // Set this now in case loop ends on its own (not via break).
-							}
-						}
-					}
-				}
-				if (hotkey_id_with_flags != HOTKEY_ID_INVALID)
-				{
-					// See the nearly identical section above for comments on the below:
-					switch (modifier_vk)
-					{
-					case VK_SHIFT: pPrefixKey = kvk + (kvk[VK_RSHIFT].is_down ? VK_RSHIFT : VK_LSHIFT); break;
-					case VK_CONTROL: pPrefixKey = kvk + (kvk[VK_RCONTROL].is_down ? VK_RCONTROL : VK_LCONTROL); break;
-					case VK_MENU: pPrefixKey = kvk + (kvk[VK_RMENU].is_down ? VK_RMENU : VK_LMENU); break;
-					default: pPrefixKey = kvk + modifier_vk;
-					}
-				}
-				else  // Now check scan codes since above didn't find one.
-				{
-					for (max = kvk[vk_neutral].nModifierSC, i = 0; i < max; ++i)
-					{
-						sc_hotkey &this_modifier_sc = kvk[vk_neutral].ModifierSC[i]; // For performance and convenience.
-						if (ksc[this_modifier_sc.sc].is_down)
-						{
-							// See similar section above for comments about the section below:
-							if (this_modifier_sc.id_with_flags & HOTKEY_KEY_UP)
-							{
-								if (!aKeyUp)
-								{
-									this_key.hotkey_to_fire_upon_release = this_modifier_sc.id_with_flags;
-									if (hotkey_id_with_flags != HOTKEY_ID_INVALID) // i.e. a previous iteration already found the down-event to fire.
-										break;
-								}
-								else // this hotkey is qualified to fire.
-								{
-									hotkey_id_with_flags = this_modifier_sc.id_with_flags;
-									modifier_sc = this_modifier_sc.sc;
-									break;
-								}
-							}
-							else // This is a normal hotkey that fires on suffix key-down.
-							{
-								if (!aKeyUp)
-								{
-									hotkey_id_with_flags = this_modifier_sc.id_with_flags;
-									modifier_sc = this_modifier_sc.sc; // Set this now in case loop ends on its own (not via break).
-								}
-							}
-						}
-					} // for()
-					if (hotkey_id_with_flags != HOTKEY_ID_INVALID)
-						pPrefixKey = ksc + modifier_sc; // See the nearly identical section above for comments.
-				} // SC vs. VK
-			} // If this_key has a counterpart neutral modifier.
-		} // Above block searched for match using neutral modifier.
-
-		hotkey_id_temp = hotkey_id_with_flags & HOTKEY_ID_MASK; // For use both inside and outside the block below.
-		if (hotkey_id_with_flags != HOTKEY_ID_INVALID)
-		{
-			// v1.0.41:
-			if (hotkey_id_temp < Hotkey::sHotkeyCount) // Don't call the below for Alt-tab hotkeys and similar.
+				hotkey_id_with_flags = found_hk->mID; // Flags not needed.
 				if (   !(firing_is_certain = Hotkey::CriterionFiringIsCertain(hotkey_id_with_flags
 					, aKeyUp, aExtraInfo, this_key.no_suppress, fire_with_no_suppress, &pKeyHistoryCurr->event_type))   )
 					return AllowKeyToGoToSystem; // This should handle pForceToggle for us, suppressing if necessary.
-				else // The naked hotkey ID may have changed, so update it (flags currently don't matter in this case).
-					hotkey_id_temp = hotkey_id_with_flags & HOTKEY_ID_MASK; // Update in case CriterionFiringIsCertain() changed it.
+			}
+			hotkey_id_temp = hotkey_id_with_flags;
 			pPrefixKey->was_just_used = AS_PREFIX_FOR_HOTKEY;
 		}
-		//else: No "else if" here to avoid an extra indentation for the whole section below (it's not needed anyway).
 
 		// Alt-tab: Alt-tab actions that require a prefix key are handled directly here rather than via
 		// posting a message back to the main window.  In part, this is because it would be difficult
@@ -1696,12 +1518,14 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 		this_key.no_suppress &= ~NO_SUPPRESS_NEXT_UP_EVENT; // This ticket has been used up, so remove it.
 	}
 
-	// v1.0.41: This must be done prior to the setting of sDisguiseNextLWinUp and similar items below.
+	// v1.0.41: This must be done prior to the setting of sDisguiseNextMenu below.
 	hotkey_id_temp = hotkey_id_with_flags & HOTKEY_ID_MASK;
 	if (hotkey_id_temp < Hotkey::sHotkeyCount // i.e. don't call the below for Alt-tab hotkeys and similar.
 		&& !firing_is_certain  // i.e. CriterionFiringIsCertain() wasn't already called earlier.
 		&& !(firing_is_certain = Hotkey::CriterionFiringIsCertain(hotkey_id_with_flags, aKeyUp, aExtraInfo, this_key.no_suppress, fire_with_no_suppress, &pKeyHistoryCurr->event_type)))
 	{
+		if (pKeyHistoryCurr->event_type == 'i') // This non-zero SendLevel event is being ignored due to #InputLevel, so unconditionally pass it through, like with is_ignored.
+			return AllowKeyToGoToSystem;
 		// v1.1.08: Although the hotkey corresponding to this event is disabled, it may need to
 		// be suppressed if it has a counterpart (key-down or key-up) hotkey which is enabled.
 		// This can be broken down into two cases:
@@ -1737,84 +1561,60 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 	// Determine the final ID at this late stage to improve maintainability:
 	HotkeyIDType hotkey_id_to_fire = hotkey_id_temp;
 
-	// If only a windows key was held down (and no other modifiers) to activate this hotkey,
-	// suppress the next win-up event so that the Start Menu won't appear (if other modifiers are
-	// present, there's no need to do this because the Start Menu doesn't appear, at least on WinXP).
-	// The appearance of the Start Menu would be caused by the fact that the hotkey's suffix key
-	// was suppressed, therefore the OS doesn't see that the WIN key "modified" anything while
-	// it was held down.  Note that if the WIN key is auto-repeating due to the user having held
-	// it down long enough, when the user presses the hotkey's suffix key, the auto-repeating
-	// stops, probably because auto-repeat is a very low-level feature.  It's also interesting
-	// that unlike non-modifier keys such as letters, the auto-repeat does not resume after
-	// the user releases the suffix, even if the WIN key is kept held down for a long time.
-	// When the user finally releases the WIN key, that release will be disguised if called
-	// for by the logic below.
-	if (aHook == g_KeybdHook)
+	// Check if the WIN or ALT key needs to be masked:
+	if (   (g_modifiersLR_logical & (MOD_LALT|MOD_RALT|MOD_LWIN|MOD_RWIN)) // ALT and/or WIN is down.
+		&& !fire_with_no_suppress // This hotkey will be suppressed (hotkeys with ~no-suppress should not require masking).
+		&& (sUndisguisedMenuInEffect || aHook == g_MouseHook)   ) // Menu has not already been disguised (as tracked by the keyboard hook), or this is the mouse hook, which may require masking anyway.
 	{
-		if (!(g_modifiersLR_logical & ~(MOD_LWIN | MOD_RWIN))) // Only lwin, rwin, both, or neither are currently down.
+		// If only a windows key was held down to activate this hotkey, suppress the next win-up
+		// event so that the Start Menu won't appear.  The appearance of the Start Menu would be
+		// caused by the fact that the hotkey's suffix key was suppressed, therefore the OS doesn't
+		// see that the WIN key "modified" anything while it was held down.
+		// Although having other modifiers present prevents the Start Menu from appearing, that's
+		// handled by later checks since the WIN key can auto-repeat, putting an unmodified WIN
+		// back into effect after the other mods are released.  This only happens if the WIN key
+		// is the most recently pressed physical key, such as if this hotkey is a mouse button.
+		// When the user finally releases the WIN key, that release will be disguised if called
+		// for by the logic below and in AllowIt().
+		if (   (g_modifiersLR_logical & (MOD_LWIN|MOD_RWIN)) // One or both are down and may require disguising.
+			&& ((g_modifiersLR_physical & (MOD_LWIN|MOD_RWIN)) // Always disguise if physically down, for backward compatibility.
+				|| Hotkey::HotkeyRequiresModLR(hotkey_id_to_fire, MOD_LWIN|MOD_RWIN))   ) // If not physically down, avoid masking hotkeys which could be intended to send {LWin up}, such as for AppsKey::RWin.
 		{
-			// If it's used as a prefix, there's no need (and it would probably break something)
-			// to disguise the key this way since the prefix-handling logic already does that
-			// whenever necessary:
-			if ((g_modifiersLR_logical & MOD_LWIN) && !kvk[VK_LWIN].used_as_prefix)
-				sDisguiseNextLWinUp = true;
-			if ((g_modifiersLR_logical & MOD_RWIN) && !kvk[VK_RWIN].used_as_prefix)
-				sDisguiseNextRWinUp = true;
+			sDisguiseNextMenu = true;
+			// An earlier stage has ensured that the keyboard hook is installed for suppression of LWin/RWin if
+			// this is a mouse hotkey, because the sending of CTRL directly (here) would otherwise not suppress
+			// the Start Menu (though it does supress menu bar activation for ALT hotkeys, as described below).
 		}
-	}
-	else // Mouse hook
-	{
-		// The mouse hook requires suppression in more situations than the keyboard because the
-		// OS does not consider LWin/RWin to have modified a mouse button, only a keyboard key.
-		// Thus, the Start Menu appears in the following cases if the user releases LWin/RWin
-		// *after* the other modifier:
-		// #+MButton::return
-		// #^MButton::return
-		if (!(g_modifiersLR_logical & (MOD_LALT|MOD_RALT)))
-		{
-			if ((g_modifiersLR_logical & MOD_LWIN) && !kvk[VK_LWIN].used_as_prefix)
-				sDisguiseNextLWinUp = true;
-			else if ((g_modifiersLR_logical & MOD_RWIN) && !kvk[VK_RWIN].used_as_prefix)
-				sDisguiseNextRWinUp = true;
-		}
-		// An earlier stage has ensured that the keyboard hook is installed for the above, because the sending
-		// of CTRL directly (here) would otherwise not suppress the Start Menu for LWin/RWin (though it does
-		// supress menu bar activation for ALT hotkeys, as described below).
-	}
 
-	// For maximum reliability on the maximum range of systems, it seems best to do the above
-	// for ALT keys also, to prevent them from invoking the icon menu or menu bar of the
-	// foreground window (rarer than the Start Menu problem, above, I think).
-	// Update for v1.0.25: This is usually only necessary for hotkeys whose only modifier is ALT.
-	// For example, Shift-Alt hotkeys do not need it if Shift is pressed after Alt because Alt
-	// "modified" the shift so the OS knows it's not a naked ALT press to activate the menu bar.
-	// Conversely, if Shift is pressed prior to Alt, but released before Alt, I think the shift-up
-	// counts as a "modification" and the same rule applies.  However, if shift is released after Alt,
-	// that would activate the menu bar unless the ALT key is disguised below.  This issue does
-	// not apply to the WIN key above because apparently it is disguised automatically
-	// whenever some other modifier was involved with it in any way and at any time during the
-	// keystrokes that comprise the hotkey.
-	if ((g_modifiersLR_logical & MOD_LALT) && !kvk[VK_LMENU].used_as_prefix)
-	{
-		if (g_KeybdHook)
-			sDisguiseNextLAltUp = true;
-		else
-			// Since no keyboard hook, no point in setting the variable because it would never be acted up.
-			// Instead, disguise the key now with a CTRL keystroke. Note that this is not done for
-			// mouse buttons that use the WIN key as a prefix because it does not work reliably for them
-			// (i.e. sometimes the Start Menu appears, even if two CTRL keystrokes are sent rather than one).
-			// Therefore, as of v1.0.25.05, mouse button hotkeys that use only the WIN key as a modifier cause
-			// the keyboard hook to be installed.  This determination is made during the hotkey loading stage.
-			KeyEvent(KEYDOWNANDUP, g_MenuMaskKey);
-	}
-	else if ((g_modifiersLR_logical & MOD_RALT) && !kvk[VK_RMENU].used_as_prefix && !ActiveWindowLayoutHasAltGr()) // If RAlt==AltGr, it should never need disguising.
-	{
-		// The two else if's above: If it's used as a prefix, there's no need (and it would probably break something)
-		// to disguise the key this way since the prefix-handling logic already does that whenever necessary.
-		if (g_KeybdHook)
-			sDisguiseNextRAltUp = true;
-		else
-			KeyEvent(KEYDOWNANDUP, g_MenuMaskKey);
+		// For maximum reliability on the maximum range of systems, it seems best to do the above
+		// for ALT keys also, to prevent them from invoking the icon menu or menu bar of the
+		// foreground window (rarer than the Start Menu problem, above, I think).
+		// Update for v1.0.25: This is usually only necessary for hotkeys whose only modifier is ALT.
+		// For example, Shift-Alt hotkeys do not need it if Shift is pressed after Alt because Alt
+		// "modified" the shift so the OS knows it's not a naked ALT press to activate the menu bar.
+		// Conversely, if Shift is pressed prior to Alt, but released before Alt, I think the shift-up
+		// counts as a "modification" and the same rule applies.  However, if shift is released after Alt,
+		// that would activate the menu bar unless the ALT key is disguised below.  This issue does
+		// not apply to the WIN key above because apparently it is disguised automatically
+		// whenever some other modifier was involved with it in any way and at any time during the
+		// keystrokes that comprise the hotkey.
+		if (   !sDisguiseNextMenu // It's not already going to be disguised due to the section above or a previous hotkey.
+			&& (g_modifiersLR_logical & (MOD_LALT|MOD_RALT)) // If RAlt==AltGr, it should never need disguising, but in that case LCtrl is also down, so ActiveWindowLayoutHasAltGr() isn't checked.
+			&& !(g_modifiersLR_logical & (MOD_LCONTROL|MOD_RCONTROL)) // No need to mask if Ctrl is down (the key-repeat issue that affects the WIN key does not affect ALT).
+			&& ((g_modifiersLR_physical & (MOD_LALT|MOD_RALT)) // Always disguise if physically down, for backward compatibility.
+				|| Hotkey::HotkeyRequiresModLR(hotkey_id_to_fire, MOD_LALT|MOD_RALT))   ) // If not physically down, avoid masking hotkeys which could be intended to send {Alt up}, such as for AppsKey::Alt.
+		{
+			if (g_KeybdHook)
+				sDisguiseNextMenu = true;
+			else
+				// Since no keyboard hook, no point in setting the variable because it would never be acted upon.
+				// Instead, disguise the key now with a CTRL keystroke. Note that this is not done for
+				// mouse buttons that use the WIN key as a prefix because it does not work reliably for them
+				// (i.e. sometimes the Start Menu appears, even if two CTRL keystrokes are sent rather than one).
+				// Therefore, as of v1.0.25.05, mouse button hotkeys that use only the WIN key as a modifier cause
+				// the keyboard hook to be installed.  This determination is made during the hotkey loading stage.
+				KeyEventMenuMask(KEYDOWNANDUP);
+		}
 	}
 
 	switch (hotkey_id_to_fire)
@@ -2026,7 +1826,7 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 			//    ToolTip `nProblem 2`n
 			//return
 			hotkey_id_to_post = hotkey_id_to_fire; // Set this only when it is certain that this ID should be sent to the main thread via msg.
-			if (firing_is_certain->mHotCriterion == HOT_IF_EXPR)
+			if (firing_is_certain->mHotCriterion && HOT_IF_REQUIRES_EVAL(firing_is_certain->mHotCriterion->Type))
 			{
 				// To avoid evaluating the expression twice, indicate to the main thread that the appropriate variant
 				// has already been determined, by packing the variant's index into the high word of the param:
@@ -2072,7 +1872,7 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 			// Alt key events would prevent it):
 			// *LAlt up::Send {LWin up}
 			// *LAlt::Send {LWin down}
-			return this_key.hotkey_down_was_suppressed ? SuppressThisKey : AllowKeyToGoToSystemButDisguiseWinAlt;
+			return this_key.hotkey_down_was_suppressed ? SuppressThisKey : AllowKeyToGoToSystem;
 
 		if (fire_with_no_suppress) // Plus we know it's not a modifier since otherwise it would've returned above.
 		{
@@ -2187,6 +1987,20 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 		}
 		else if (aVK == VK_LMENU || aVK == VK_RMENU)
 		{
+			// Fix for v1.1.26.01: Added KEY_BLOCK_THIS to suppress the Alt key-up, which fixes an issue
+			// which could be reproduced as follows:
+			//  - Test with an Alt-blocking hotkey such as LAlt::return or LAlt::LCtrl.
+			//  - Open Notepad and alt-tab away using the other Alt key or a remapping such as LCtrl::LAlt.
+			//  - Reactivate Notepad and note that the keyboard accelerators (underlined letters) are still
+			//    visible in the menus (usually).
+			//  - Press LAlt and the menus are activated once, even though LAlt is supposed to be blocked.
+			// Additionally, a Windows 10 check was added because the original issue this workaround was
+			// intended for doesn't appear to occur on Windows 10 (tested on 10.0.15063).  This check was
+			// removed for v1.1.27.00 to ensure consistent behaviour of AltGr hotkeys across OS versions.
+			// (Sending RAlt up on a layout with AltGr causes the system to send LCtrl up.)
+			// Testing on XP, Vista and 8.1 showed that the #LAlt issue below only occurred if the key-up
+			// was allowed to pass through to the active window.  It appeared to be a non-issue on Win 10
+			// even when the Alt key-up was passed through.
 			// Fix for v1.0.34: For some reason, the release of the ALT key here causes the Start Menu
 			// to appear instantly for the hotkey #LAlt (and probably #RAlt), even when the hotkey does
 			// nothing other than return.  This seems like an OS quirk since it doesn't conform to any
@@ -2194,9 +2008,9 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 			// down.  To work around it, send the menu-suppressing Control keystroke here.  Another one
 			// will probably be sent later when the WIN key is physically released, but it seems best
 			// for simplicity and avoidance of side-effects not to make this one prevent that one.
-			if (   (g_modifiersLR_logical & (MOD_LWIN | MOD_RWIN))   // At least one WIN key is down.
-				&& !(g_modifiersLR_logical & (MOD_LSHIFT | MOD_RSHIFT | MOD_LCONTROL | MOD_RCONTROL))   ) // But no SHIFT or CONTROL key is down to help us.
-				KeyEvent(KEYDOWNANDUP, g_MenuMaskKey);
+			//if (   (g_modifiersLR_logical & (MOD_LWIN | MOD_RWIN))   // At least one WIN key is down.
+			//	&& !(g_modifiersLR_logical & (MOD_LSHIFT | MOD_RSHIFT | MOD_LCONTROL | MOD_RCONTROL))   ) // But no SHIFT or CONTROL key is down to help us.
+			//	KeyEventMenuMask(KEYDOWNANDUP);
 			// Since this is a hotkey that fires on ALT-DOWN and it's a normal (suppressed) hotkey,
 			// send an up-event to "turn off" the OS's low-level handling for the alt key with
 			// respect to having it modify keypresses.  For example, the following hotkeys would
@@ -2204,7 +2018,7 @@ LRESULT LowLevelCommon(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lPara
 			// the ALT key is physically down even though it is not logically down:
 			// RAlt::Send f  ; Actually triggers !f, which activates the FILE menu if the active window has one.
 			// RAlt::Send {PgDn}  ; Fails to work because ALT-PgDn usually does nothing.
-			KeyEvent(KEYUP, aVK, aSC);
+			KeyEvent(KEYUP, aVK, aSC, NULL, false, KEY_BLOCK_THIS);
 		}
 	}
 	
@@ -2295,7 +2109,7 @@ LRESULT SuppressThisKeyFunc(const HHOOK aHook, LPARAM lParam, const vk_type aVK,
 
 
 LRESULT AllowIt(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lParam, const vk_type aVK, const sc_type aSC
-	, bool aKeyUp, KeyHistoryItem *pKeyHistoryCurr, WPARAM aHotkeyIDToPost, bool aDisguiseWinAlt)
+	, bool aKeyUp, KeyHistoryItem *pKeyHistoryCurr, WPARAM aHotkeyIDToPost)
 // Always use the parameter vk rather than event.vkCode because the caller or caller's caller
 // might have adjusted vk, namely to make it a left/right specific modifier key rather than a
 // neutral one.
@@ -2366,7 +2180,7 @@ LRESULT AllowIt(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lParam, cons
 
 		// This is done unconditionally so that even if a qualified Input is not in progress, the
 		// variable will be correctly reset anyway:
-		if ((Hotstring::mAtLeastOneEnabled && !is_ignored) || (g_input.status == INPUT_IN_PROGRESS && !(g_input.IgnoreAHKInput && is_ignored)))
+		if ((Hotstring::sEnabledCount && !is_ignored) || (g_input.status == INPUT_IN_PROGRESS && !(g_input.IgnoreAHKInput && is_ignored)))
 			if (!CollectInput(event, aVK, aSC, aKeyUp, is_ignored, pKeyHistoryCurr, hs_wparam_to_post, hs_lparam_to_post)) // Key should be invisible (suppressed).
 				return SuppressThisKeyFunc(aHook, lParam, aVK, aSC, aKeyUp, pKeyHistoryCurr, aHotkeyIDToPost, hs_wparam_to_post, hs_lparam_to_post);
 
@@ -2456,7 +2270,7 @@ LRESULT AllowIt(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lParam, cons
 			&& !(g_modifiersLR_logical & (MOD_LCONTROL | MOD_RCONTROL))) // Neither CTRL key is down.
 			sAltTabMenuIsVisible = true;
 
-		if (kvk[aVK].as_modifiersLR) // It's a modifier key.
+		if (modLR_type modLR = kvk[aVK].as_modifiersLR) // It's a modifier key.
 		{
 			// Don't do it this way because then the alt key itself can't be reliable used as "AltTabMenu"
 			// (due to ShiftAltTab causing sAltTabMenuIsVisible to become false):
@@ -2472,38 +2286,62 @@ LRESULT AllowIt(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lParam, cons
 				// display the Alt-tab menu, we would incorrectly believe the menu to be displayed:
 				sAltTabMenuIsVisible = false;
 
-			bool vk_is_win = aVK == VK_LWIN || aVK == VK_RWIN;
-			if (aDisguiseWinAlt && aKeyUp && (vk_is_win || aVK == VK_MENU || aVK == VK_LMENU
-				|| aVK == VK_RMENU && !ActiveWindowLayoutHasAltGr())) // AltGr should never need disguising, and avoiding it may help avoid unwanted side-effects.
+			if (!aKeyUp) // Key-down.
 			{
-				// I think the best way to do this is to suppress the given key-event and substitute
-				// some new events to replace it.  This is because otherwise we would probably have to
-				// Sleep() or wait for the shift key-down event to take effect before calling
-				// CallNextHookEx(), so that the shift key will be in effect in time for the win
-				// key-up event to be disguised properly.  UPDATE: Currently, this doesn't check
-				// to see if a shift key is already down for some other reason; that would be
-				// pretty rare anyway, and I have more confidence in the reliability of putting
-				// the shift key down every time.  UPDATE #2: Ctrl vs. Shift is now used to avoid
-				// issues with the system's language-switch hotkey.  See detailed comments in
-				// SetModifierLRState() about this.
-				// Also, check the current logical state of CTRL to see if it's already down, for these reasons:
-				// 1) There is no need to push it down again, since the release of ALT or WIN will be
-				//    successfully disguised as long as it's down currently.
-				// 2) If it's already down, the up-event part of the disguise keystroke would put it back
-				//    up, which might mess up other things that rely upon it being down.
-				bool disguise_it = true;  // Starting default.
-				if (g_modifiersLR_logical & (MOD_LCONTROL | MOD_RCONTROL))
-					disguise_it = false; // LCTRL or RCTRL is already down, so disguise is already in effect.
-				else if (   vk_is_win && (g_modifiersLR_logical & (MOD_LSHIFT | MOD_RSHIFT | MOD_LALT | MOD_RALT))   )
-					disguise_it = false; // WIN key disguise is easier to satisfy, so don't need it in these cases either.
+				// sUndisguisedMenuInEffect can be true or false prior to this.
+				//  LAlt (true) + LWin = both disguised (false).
+				//  LWin (true) + LAlt = both disguised (false).
+				if (modLR & (MOD_LWIN | MOD_RWIN))
+					sUndisguisedMenuInEffect = !(g_modifiersLR_logical & ~(MOD_LWIN | MOD_RWIN)); // If any other modifier is down, disguise is already in effect.
+				else if (modLR & (MOD_LALT | MOD_RALT))
+					sUndisguisedMenuInEffect = !(g_modifiersLR_logical & (MOD_LCONTROL | MOD_RCONTROL)); // If Ctrl is down (including if this Alt is AltGr), disguise is already in effect.
+				else // Shift or Ctrl: pressing either serves to disguise any previous Alt or Win.
+					sUndisguisedMenuInEffect = false;
+			}
+			else if (sDisguiseNextMenu)
+			{
+				// If LWin/RWin is still physically down (or down due to an explicit Send, such as a remapping),
+				// keep watching until it is released so that if key-repeat puts it back into effect, it will be
+				// disguised again.  _non_ignored is used to ignore temporary modifier changes made during a
+				// Send which aren't explicit, such as `Send x` temporarily releasing LWin/RWin.  Without this,
+				// something like AppsKey::RWin would not work well with other hotkeys which Send.
+				// v1.1.27.01: This section now also handles Ctrl-up and Shift-up events, which not only fail to
+				// disguise Win but actually cause the Start menu to immediately appear even though the Win key
+				// has not been released.  This only occurs if it was not already disguised by the Ctrl/Shift down
+				// event; i.e. when an isolated Ctrl/Shift up event is received without a corresponding down event.
+				// "Physical" events of this kind can be sent by the system when switching from a window with UK
+				// layout to a window with US layout.  This is likely related to the UK layout having AltGr.
+				if (  !(g_modifiersLR_logical_non_ignored & (MOD_LWIN | MOD_RWIN))  )
+				{
+					if (modLR & (MOD_LCONTROL | MOD_RCONTROL | MOD_LSHIFT | MOD_RSHIFT))
+					{
+						// v1.1.27.01: Since this key being released is Ctrl/Shift and Win is not down, this must
+						// be in combination with Alt, which can be disguised by this event.  By contrast, if the
+						// Win key was down and sUndisguisedMenuInEffect == true (meaning there was no Ctrl/Shift
+						// down event prior to this up event), this event needs to be disguised for the reason
+						// described above.
+						sUndisguisedMenuInEffect = false;
+					}
+					sDisguiseNextMenu = false;
+				}
 				// Since the below call to KeyEvent() calls the keybd hook recursively, a quick down-and-up
-				// on Control is all that is necessary to disguise the key.  This is because the OS will see
-				// that the Control keystroke occurred while ALT or WIN is still down because we haven't
-				// done CallNextHookEx() yet.
-				if (disguise_it)
-					KeyEvent(KEYDOWNANDUP, g_MenuMaskKey); // Fix for v1.0.25: Use Ctrl vs. Shift to avoid triggering the LAlt+Shift language-change hotkey.
+				// is all that is necessary to disguise the key.  This is because the OS will see that the
+				// keystroke occurred while ALT or WIN is still down because we haven't done CallNextHookEx() yet.
+				if (sUndisguisedMenuInEffect)
+					KeyEventMenuMask(KEYDOWNANDUP); // This should also cause sUndisguisedMenuInEffect to be reset.
+			}
+			else // A modifier key was released and sDisguiseNextMenu was false.
+			{
+				// Now either no menu keys are down or they have been disguised by this keyup event.
+				// Key-repeat may put the menu key back into effect, but that will be detected above.
+				sUndisguisedMenuInEffect = false;
 			}
 		} // It's a modifier key.
+		else // It's not a modifier key.
+		{
+			// Any key press or release serves to disguise the menu key.
+			sUndisguisedMenuInEffect = false;
+		}
 	} // Keyboard vs. mouse hook.
 
 	// Since above didn't return, this keystroke is being passed through rather than suppressed.
@@ -2562,11 +2400,15 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 	// indirectly via a different hotstring:
 	bool do_monitor_hotstring = shs && !aIsIgnored && treat_as_visible;
 	bool do_input = g_input.status == INPUT_IN_PROGRESS && !(g_input.IgnoreAHKInput && aIsIgnored);
+	
+	static vk_type sPendingDeadKeyVK = 0;
+	static sc_type sPendingDeadKeySC = 0; // Need to track this separately because sometimes default VK-to-SC mapping isn't correct.
+	static bool sPendingDeadKeyUsedShift = false;
+	static bool sPendingDeadKeyUsedAltGr = false;
 
-	UCHAR end_key_attributes;
 	if (do_input && aVK != VK_PACKET)
 	{
-		end_key_attributes = g_input.EndVK[aVK];
+		UCHAR end_key_attributes = g_input.EndVK[aVK];
 		if (!end_key_attributes)
 			end_key_attributes = g_input.EndSC[aSC];
 		if (end_key_attributes) // A terminating keystroke has now occurred unless the shift state isn't right.
@@ -2588,9 +2430,10 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 				g_input.EndingChar = 0;
 				// Don't change this line:
 				g_input.EndingRequiredShift = shift_must_be_down && (g_modifiersLR_logical & (MOD_LSHIFT | MOD_RSHIFT));
-				if (!do_monitor_hotstring)
+				if (!do_monitor_hotstring && !sPendingDeadKeyVK)
 					return treat_as_visible;
-				// else need to return only after the input is collected for the hotstring.
+				// else need to return only after the input is collected for the hotstring,
+				// or after determining whether this key completes the pending dead key sequence.
 			}
 		}
 	}
@@ -2640,7 +2483,7 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 	if (g_modifiersLR_logical
 		&& !(g_input.status == INPUT_IN_PROGRESS && g_input.TranscribeModifiedKeys)
 		&& g_modifiersLR_logical != MOD_LSHIFT && g_modifiersLR_logical != MOD_RSHIFT
-		&& g_modifiersLR_logical != (MOD_LSHIFT & MOD_RSHIFT)
+		&& g_modifiersLR_logical != (MOD_LSHIFT | MOD_RSHIFT)
 		&& !((g_modifiersLR_logical & (MOD_LALT | MOD_RALT)) && (g_modifiersLR_logical & (MOD_LCONTROL | MOD_RCONTROL))))
 		// Since in some keybd layouts, AltGr (Ctrl+Alt) will produce valid characters (such as the @ symbol,
 		// which is Ctrl+Alt+Q in the German/IBM layout and Ctrl+Alt+2 in the Spanish layout), an attempt
@@ -2656,11 +2499,6 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 		// Note that ToAsciiEx() will translate ^i to a tab character, !i to plain i, and many other modified
 		// letters as just the plain letter key, which we don't want.
 		return treat_as_visible;
-
-	static vk_type sPendingDeadKeyVK = 0;
-	static sc_type sPendingDeadKeySC = 0; // Need to track this separately because sometimes default VK-to-SC mapping isn't correct.
-	static bool sPendingDeadKeyUsedShift = false;
-	static bool sPendingDeadKeyUsedAltGr = false;
 
 	// v1.0.21: Only true (unmodified) backspaces are recognized by the below.  Another reason to do
 	// this is that ^backspace has a native function (delete word) different than backspace in many editors.
@@ -2682,11 +2520,47 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 		return treat_as_visible;
 	}
 
+	// v1.1.28.00: active_window is set to the focused control, if any, so that the hotstring buffer is reset
+	// when the focus changes between controls, not just between windows.
+	// v1.1.28.01: active_window is left as the active window; the above is not done because it disrupts
+	// hotstrings when the first keypress causes a change in focus, such as to enter editing mode in Excel.
+	// See Get_active_window_keybd_layout macro definition for related comments.
+	HWND active_window = GetForegroundWindow(); // Set default in case there's no focused control.
+	HKL active_window_keybd_layout = GetKeyboardLayout(GetFocusedCtrlThread(NULL, active_window));
+
+	// Univeral Windows Platform apps apparently have their own handling for dead keys:
+	//  - Dead key followed by Esc produces Chr(27), unlike non-UWP apps.
+	//  - Pressing a dead key in a UWP app does not leave it in the keyboard layout's buffer,
+	//    so to get the correct result here we must translate the dead key again, first.
+	//  - Pressing a non-dead key disregards any dead key which was placed into the buffer by
+	//    calling ToUnicodeEx, and it is left in the buffer.  To get the correct result for the
+	//    next call, we must NOT reinsert it into the buffer (see dead_key_sequence_complete).
+	static bool sUwpAppFocused = false;
+	static HWND sUwpHwndChecked = 0;
+	if (sUwpHwndChecked != active_window)
+	{
+		sUwpHwndChecked = active_window;
+		TCHAR class_name[28];
+		GetClassName(active_window, class_name, _countof(class_name));
+		sUwpAppFocused = !_tcsicmp(class_name, _T("ApplicationFrameWindow"));
+	}
 
 	int char_count;
 	TBYTE ch[3];
 	BYTE key_state[256];
 	memcpy(key_state, g_PhysicalKeyState, 256);
+
+	if (sPendingDeadKeyVK && sUwpAppFocused && aVK != VK_PACKET)
+	{
+		AdjustKeyState(key_state
+			, (sPendingDeadKeyUsedAltGr ? MOD_LCONTROL|MOD_RALT : 0)
+			| (sPendingDeadKeyUsedShift ? MOD_RSHIFT : 0)); // Left vs Right Shift probably doesn't matter in this context.
+		// If it turns out there was already a dead key in the buffer, the second call puts it back.
+		if (ToUnicodeOrAsciiEx(sPendingDeadKeyVK, sPendingDeadKeySC, key_state, ch, 0, active_window_keybd_layout) > 0)
+			ToUnicodeOrAsciiEx(sPendingDeadKeyVK, sPendingDeadKeySC, key_state, ch, 0, active_window_keybd_layout);
+		sPendingDeadKeyVK = 0; // Don't reinsert it afterward (see above).
+	}
+
 	// As of v1.0.25.10, the below fixes the Input command so that when it is capturing artificial input,
 	// such as from the Send command or a hotstring's replacement text, the captured input will reflect
 	// any modifiers that are logically but not physically down (or vice versa):
@@ -2696,11 +2570,6 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 		key_state[VK_CAPITAL] |= STATE_ON;
 	else
 		key_state[VK_CAPITAL] &= ~STATE_ON;
-
-	// Use ToAsciiEx() vs. ToAscii() because there is evidence from Putty author that ToAsciiEx() works better
-	// with more keyboard layouts under 2k/XP than ToAscii() does (though if true, there is no MSDN explanation). 
-	// UPDATE: In v1.0.44.03, need to use ToAsciiEx() anyway because of the adapt-to-active-window-layout feature.
-	Get_active_window_keybd_layout // Defines the variables active_window and active_window_keybd_layout for use below.
 
 	if (aVK == VK_PACKET)
 	{
@@ -2734,6 +2603,9 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 	// VK_TAB & VK_ESCAPE
 	// These keys have an ascii translation but should not trigger/complete a pending dead key,
 	// at least not on the Spanish and Danish layouts, which are the two I've tested so far.
+	// UPDATE: Above appears to be untrue (tested on Windows 10 and XP).  Both Tab and Esc complete
+	// the dead key sequence (by inserting the dead char and tab/nothing), so excluding these keys
+	// actually causes unwanted side-effects.
 
 	// Dead keys in Danish layout as they appear on a US English keyboard: Equals and Plus /
 	// Right bracket & Brace / probably others.
@@ -2762,7 +2634,7 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 	// allows dead keys to continue to operate properly in the user's foreground window, while still
 	// being capturable by the Input command and recognizable by any defined hotstrings whose
 	// abbreviations use diacritical letters:
-	bool dead_key_sequence_complete = sPendingDeadKeyVK && aVK != VK_TAB && aVK != VK_ESCAPE;
+	bool dead_key_sequence_complete = sPendingDeadKeyVK;
 	if (char_count < 0) // It's a dead key, and it doesn't complete a sequence since in that case char_count would be >= 1.
 	{
 		if (treat_as_visible)
@@ -2892,12 +2764,11 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 				if (   cphs >= hs.mString // One of the loops above stopped early due discovering "no match"...
 					// ... or it did but the "?" option is not present to protect from the fact that
 					// what lies to the left of this hotstring abbreviation is an alphanumeric character:
-					|| !hs.mDetectWhenInsideWord && cpbuf >= g_HSBuf && IsCharAlphaNumeric(*cpbuf)
+					|| !hs.mDetectWhenInsideWord && cpbuf >= g_HSBuf && IsHotstringWordChar(*cpbuf)
 					// ... v1.0.41: Or it's a perfect match but the right window isn't active or doesn't exist.
 					// In that case, continue searching for other matches in case the script contains
 					// hotstrings that would trigger simultaneously were it not for the "only one" rule.
-					// L4: Added hs.mHotExprLine for #if (expression).
-					|| !HotCriterionAllowsFiring(hs.mHotCriterion, hs.mHotWinTitle, hs.mHotWinText, hs.mHotExprIndex, hs.mJumpToLabel ? hs.mJumpToLabel->mName : _T(""))   )
+					|| !HotCriterionAllowsFiring(hs.mHotCriterion, hs.mName)   )
 					continue; // No match or not eligible to fire.
 					// v1.0.42: The following scenario defeats the ability to give criterion hotstrings
 					// precedence over non-criterion:
@@ -3039,7 +2910,7 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 				// Consequently, the buffer should be adjusted below to ensure it's in the right state to work
 				// in situations such as the user typing two hotstrings consecutively where the ending
 				// character of the first is used as a valid starting character (non-alphanumeric) for the next.
-				if (*hs.mReplacement)
+				if (hs.mReplacement)
 				{
 					// Since the buffer no longer reflects what is actually on screen to the left
 					// of the caret position (since a replacement is about to be done), reset the
@@ -3099,8 +2970,6 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 	// the letter "a" to produce á.
 	if (dead_key_sequence_complete)
 	{
-		vk_type vk_to_send = sPendingDeadKeyVK; // To facilitate early reset below.
-		sPendingDeadKeyVK = 0; // First reset this because below results in a recursive call to keyboard hook.
 		// If there's an Input in progress and it's invisible, the foreground app won't see the keystrokes,
 		// thus no need to re-insert the dead key into the keyboard buffer.  Note that the Input might have
 		// been in progress upon entry to this function but now isn't due to INPUT_TERMINATED_BY_ENDKEY above.
@@ -3113,7 +2982,8 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 				, (sPendingDeadKeyUsedAltGr ? MOD_LCONTROL|MOD_RALT : 0)
 				| (sPendingDeadKeyUsedShift ? MOD_RSHIFT : 0)); // Left vs Right Shift probably doesn't matter in this context.
 			TCHAR temp_ch[2];
-			ToUnicodeOrAsciiEx(vk_to_send, sPendingDeadKeySC, key_state, temp_ch, 0, active_window_keybd_layout);
+			ToUnicodeOrAsciiEx(sPendingDeadKeyVK, sPendingDeadKeySC, key_state, temp_ch, 0, active_window_keybd_layout);
+			sPendingDeadKeyVK = 0;
 		}
 	}
 
@@ -3202,6 +3072,32 @@ bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC,
 		g_input.status = INPUT_LIMIT_REACHED;
 	return treat_as_visible;
 #undef shs  // To avoid naming conflicts
+}
+
+
+
+bool IsHotstringWordChar(TCHAR aChar)
+// Returns true if aChar would be part of a word if followed by a word char.
+// aChar itself may be a word char or a nonspacing mark which combines with
+// the next character (the first character of a potential hotstring match).
+{
+	// IsCharAlphaNumeric is used for simplicity and to preserve old behaviour
+	// (with the only exception being the one added below), in case it's what
+	// users have come to expect.  Note that checking for C1_ALPHA or C3_ALPHA
+	// and C1_DIGIT is not equivalent: Michael S. Kaplan wrote that the real
+	// conditions are "(C1_ALPHA && ! (C3_HIRAGANA | C3_KATAKANA) || C1_DIGIT)" -- https://web.archive.org/web/20130627015450/http://blogs.msdn.com/b/michkap/archive/2007/06/19/3396819.aspx
+	if (IsCharAlphaNumeric(aChar))
+		return true;
+	WORD char_type;
+	if (GetStringTypeEx(LOCALE_USER_DEFAULT, CT_CTYPE3, &aChar, 1, &char_type))
+	{
+		// Nonspacing marks combine with the following character, so would visually
+		// appear to be part of the word.  This should fix detection of words beginning
+		// with or containing Arabic nonspacing diacritics, for example.
+		if (char_type & C3_NONSPACING)
+			return true;
+	}
+	return false;
 }
 
 
@@ -3379,7 +3275,7 @@ bool KeybdEventIsPhysical(DWORD aEventFlags, const vk_type aVK, bool aKeyUp)
 	// the LControl event received here is marked as physical by the OS or keyboard driver.  This is undesirable
 	// primarily because it makes g_TimeLastInputPhysical inaccurate, but also because falsely marked physical
 	// events can impact the script's calls to GetKeyState("LControl", "P"), etc.
-	g_TimeLastInputPhysical = GetTickCount();
+	g_TimeLastInputPhysical = g_TimeLastInputKeyboard = GetTickCount();
 	return true;
 }
 
@@ -3690,7 +3586,7 @@ void ChangeHookState(Hotkey *aHK[], int aHK_count, HookType aWhichHook, HookType
 			|| !(ksc = new key_type[SC_ARRAY_COUNT])
 			|| !(kvkm = new HotkeyIDType[KVKM_SIZE])
 			|| !(kscm = new HotkeyIDType[KSCM_SIZE])
-			|| !(hotkey_up = new HotkeyIDType[MAX_HOTKEYS])   )
+			|| !(hotkey_up = (HotkeyIDType *)malloc(Hotkey::shkMax * sizeof(HotkeyIDType)))   )
 		{
 			// At least one of the allocations failed.
 			// Keep all 4 objects in sync with one another (i.e. either all allocated, or all not allocated):
@@ -3764,11 +3660,10 @@ void ChangeHookState(Hotkey *aHK[], int aHK_count, HookType aWhichHook, HookType
 		kvkm[i] = HOTKEY_ID_INVALID;
 	for (i = 0; i < KSCM_SIZE; ++i) // Simplify by viewing 2-dimensional array as a 1-dimensional array.
 		kscm[i] = HOTKEY_ID_INVALID;
-	for (i = 0; i < MAX_HOTKEYS; ++i)
+	for (i = 0; i < Hotkey::shkMax; ++i)
 		hotkey_up[i] = HOTKEY_ID_INVALID;
 
-	hk_sorted_type hk_sorted[MAX_HOTKEYS];
-	ZeroMemory(hk_sorted, sizeof(hk_sorted));
+	hk_sorted_type *hk_sorted = new hk_sorted_type[Hotkey::sHotkeyCount];
 	int hk_sorted_count = 0;
 	key_type *pThisKey = NULL;
 	for (i = 0; i < aHK_count; ++i)
@@ -3879,39 +3774,31 @@ void ChangeHookState(Hotkey *aHK[], int aHK_count, HookType aWhichHook, HookType
 			hotkey_id_with_flags |= HOTKEY_KEY_UP;
 		}
 
+		bool hk_is_custom_combo = hk.mModifierVK || hk.mModifierSC;
+
 		// If this is a naked (unmodified) modifier key, make it a prefix if it ever modifies any
 		// other hotkey.  This processing might be later combined with the hotkeys activation function
 		// to eliminate redundancy / improve efficiency, but then that function would probably need to
 		// init everything else here as well:
-		if (pThisKey->as_modifiersLR && !hk.mModifiersConsolidatedLR && !hk.mModifierVK && !hk.mModifierSC
+		if (pThisKey->as_modifiersLR && !hk.mModifiersConsolidatedLR && !hk_is_custom_combo
 			&& !(hk.mNoSuppress & AT_LEAST_ONE_VARIANT_HAS_TILDE)) // v1.0.45.02: ~Alt, ~Control, etc. should fire upon press-down, not release (broken by 1.0.44's PREFIX_FORCED, but I think it was probably broken in pre-1.0.41 too).
 			SetModifierAsPrefix(hk.mVK, hk.mSC);
 
-		if (hk.mModifierVK)
+		if (hk_is_custom_combo)
 		{
-			if (kvk[hk.mModifierVK].as_modifiersLR)
-				// The hotkey's ModifierVK is itself a modifier.
-				SetModifierAsPrefix(hk.mModifierVK, 0, true);
-			else
+			if (hk.mModifierVK)
 			{
-				kvk[hk.mModifierVK].used_as_prefix = PREFIX_ACTUAL;
-				if (hk.mNoSuppress & NO_SUPPRESS_PREFIX)
-					kvk[hk.mModifierVK].no_suppress |= NO_SUPPRESS_PREFIX;
-			}
-			if (pThisKey->nModifierVK < MAX_MODIFIER_VKS_PER_SUFFIX)  // else currently no error-reporting.
-			{
-				pThisKey->ModifierVK[pThisKey->nModifierVK].vk = hk.mModifierVK;
-				if (hk.mHookAction)
-					pThisKey->ModifierVK[pThisKey->nModifierVK].id_with_flags = hk.mHookAction;
+				if (kvk[hk.mModifierVK].as_modifiersLR)
+					// The hotkey's ModifierVK is itself a modifier.
+					SetModifierAsPrefix(hk.mModifierVK, 0, true);
 				else
-					pThisKey->ModifierVK[pThisKey->nModifierVK].id_with_flags = hotkey_id_with_flags;
-				++pThisKey->nModifierVK;
-				continue;
+				{
+					kvk[hk.mModifierVK].used_as_prefix = PREFIX_ACTUAL;
+					if (hk.mNoSuppress & NO_SUPPRESS_PREFIX)
+						kvk[hk.mModifierVK].no_suppress |= NO_SUPPRESS_PREFIX;
+				}
 			}
-		}
-		else
-		{
-			if (hk.mModifierSC)
+			else //if (hk.mModifierSC)
 			{
 				if (ksc[hk.mModifierSC].as_modifiersLR)  // Fixed for v1.0.35.13 (used to be kvk vs. ksc).
 					// The hotkey's ModifierSC is itself a modifier.
@@ -3926,28 +3813,22 @@ void ChangeHookState(Hotkey *aHK[], int aHK_count, HookType aWhichHook, HookType
 					// scan code:
 					ksc[hk.mModifierSC].sc_takes_precedence = true;
 				}
-				if (pThisKey->nModifierSC < MAX_MODIFIER_SCS_PER_SUFFIX)  // else currently no error-reporting.
-				{
-					pThisKey->ModifierSC[pThisKey->nModifierSC].sc = hk.mModifierSC;
-					if (hk.mHookAction)
-						pThisKey->ModifierSC[pThisKey->nModifierSC].id_with_flags = hk.mHookAction;
-					else
-						pThisKey->ModifierSC[pThisKey->nModifierSC].id_with_flags = hotkey_id_with_flags;
-					++pThisKey->nModifierSC;
-					continue;
-				}
 			}
-			#ifndef SEND_NOSUPPRESS_PREFIX_KEY_ON_RELEASE // Search for this symbol for details.
-			else
-			{
-				// If this hotkey is a lone key with ~ prefix such as "~a::", the following ensures that
-				// the ~ prefix is respected even if the key is also used as a prefix in a custom combo,
-				// such as "a & b::".  This is consistent with the behaviour of "~a & b::".
-				if (!hk.mModifiersConsolidatedLR && (hk.mNoSuppress & AT_LEAST_ONE_VARIANT_HAS_TILDE))
-					pThisKey->no_suppress |= NO_SUPPRESS_PREFIX;
-			}
-			#endif
+			// Insert this hotkey at the front of the linked list of combos which use this suffix key.
+			hk.mNextCustomCombo = pThisKey->first_custom_combo;
+			pThisKey->first_custom_combo = hk.mID;
+			continue;
 		}
+		#ifndef SEND_NOSUPPRESS_PREFIX_KEY_ON_RELEASE // Search for this symbol for details.
+		else
+		{
+			// If this hotkey is a lone key with ~ prefix such as "~a::", the following ensures that
+			// the ~ prefix is respected even if the key is also used as a prefix in a custom combo,
+			// such as "a & b::".  This is consistent with the behaviour of "~a & b::".
+			if (!hk.mModifiersConsolidatedLR && (hk.mNoSuppress & AT_LEAST_ONE_VARIANT_HAS_TILDE))
+				pThisKey->no_suppress |= NO_SUPPRESS_PREFIX;
+		}
+		#endif
 
 		// At this point, since the above didn't "continue", this hotkey is one without a ModifierVK/SC.
 		// Put it into a temporary array, which will be later sorted:
@@ -3970,6 +3851,7 @@ void ChangeHookState(Hotkey *aHK[], int aHK_count, HookType aWhichHook, HookType
 		// modifiersLR into its column in the kvkm or kscm arrays.
 
 		mod_type modifiers, i_modifiers_merged;
+		modLR_type i_modifiersLR_excluded;
 		int modifiersLR;  // Don't make this modLR_type to avoid integer overflow, since it's a loop-counter.
 		bool prev_hk_is_key_up, this_hk_is_key_up;
 		HotkeyIDType this_hk_id;
@@ -3983,21 +3865,23 @@ void ChangeHookState(Hotkey *aHK[], int aHK_count, HookType aWhichHook, HookType
 			i_modifiers_merged = this_hk.modifiers;
 			if (this_hk.modifiersLR)
 				i_modifiers_merged |= ConvertModifiersLR(this_hk.modifiersLR);
+			
+			// Fixed for v1.1.27.00: Calculate the modifiersLR bits which are NOT allowed to be set.
+			// This fixes <^A erroneously taking over <>^A, and reduces the work that must be done
+			// on each iteration of the loop below.
+			i_modifiersLR_excluded = this_hk.AllowExtraModifiers ? 0
+				: ~(this_hk.modifiersLR | ConvertModifiers(this_hk.modifiers));
 
 			for (modifiersLR = 0; modifiersLR <= MODLR_MAX; ++modifiersLR)  // For each possible LR value.
 			{
+				if (modifiersLR & i_modifiersLR_excluded) // Checked first to avoid the ConvertModifiersLR call in many cases.
+					continue;
 				modifiers = ConvertModifiersLR(modifiersLR);
-				if (this_hk.AllowExtraModifiers)
-				{
-					// True if modifiersLR is a superset of i's modifier value.  In other words,
-					// modifiersLR has the minimum required keys but also has some
-					// extraneous keys, which are allowed in this case:
-					if (i_modifiers_merged != (modifiers & i_modifiers_merged))
-						continue;
-				}
-				else
-					if (i_modifiers_merged != modifiers)
-						continue;
+				// Below is true if modifiersLR is a superset of i's modifier value.  In other words,
+				// modifiersLR has the minimum required keys.  It may also have some extraneous keys,
+				// but only if they were not excluded by the check above, in which case they are allowed.
+				if (i_modifiers_merged != (modifiers & i_modifiers_merged))
+					continue;
 
 				// In addition to the above, modifiersLR must also have the *specific* left or right keys
 				// found in i's modifiersLR.  In other words, i's modifiersLR must be a perfect subset
@@ -4125,8 +4009,76 @@ void ChangeHookState(Hotkey *aHK[], int aHK_count, HookType aWhichHook, HookType
 		}
 	}
 
+	delete[] hk_sorted;
+
+	// Support "Control", "Alt" and "Shift" as suffix keys by appending their lists of
+	// custom combos to the lists used by their left and right versions.  This avoids the
+	// need for the hook to detect these keys and perform a search through a second list.
+	// This must be done after all custom combos have been processed above, since they
+	// might be defined in any order, but the neutral hotkeys must be placed last.
+	if (kvk[VK_SHIFT].used_as_suffix) // Skip the following unless Shift, LShift or RShift was used as a suffix.
+		LinkKeysForCustomCombo(VK_SHIFT, VK_LSHIFT, VK_RSHIFT);
+	if (kvk[VK_CONTROL].used_as_suffix)
+		LinkKeysForCustomCombo(VK_CONTROL, VK_LCONTROL, VK_RCONTROL);
+	if (kvk[VK_MENU].used_as_suffix)
+		LinkKeysForCustomCombo(VK_MENU, VK_LMENU, VK_RMENU);
+
 	// Add or remove hooks, as needed.  No change is made if the hooks are already in the correct state.
 	AddRemoveHooks(hooks_to_be_active);
+}
+
+
+
+bool HookAdjustMaxHotkeys(Hotkey **&aHK, int &aCurrentMax, int aNewMax)
+{
+	Hotkey **new_shk = (Hotkey **)malloc(aNewMax * sizeof(Hotkey *));
+	if (!new_shk)
+		return false;
+	HotkeyIDType *new_hotkey_up = NULL;
+	if (   hotkey_up // No allocation needed if the hooks haven't been active yet.
+		&& !(new_hotkey_up = (HotkeyIDType *)malloc(aNewMax * sizeof(HotkeyIDType)))   )
+	{
+		free(new_shk);
+		return false;
+	}
+	// From here on, success is certain.
+	if (aCurrentMax)
+	{
+		memcpy(new_shk, aHK, aCurrentMax * sizeof(Hotkey *));
+		if (hotkey_up)
+			memcpy(new_hotkey_up, hotkey_up, aCurrentMax * sizeof(HotkeyIDType));
+			// No initialization is needed for the new portion since the hook won't be aware
+			// of any new hotkeys prior to ChangeHookState(), which also refreshes hotkey_up.
+	}
+	Hotkey **old_shk = aHK;
+	HotkeyIDType *old_hotkey_up = hotkey_up;
+	aHK = new_shk;
+	hotkey_up = new_hotkey_up;
+	// At this stage, old_shk and new_shk are interchangeable.  To avoid race conditions with
+	// the hook thread, wait for it to reach a known idle state before freeing the old array.
+	WaitHookIdle();
+	aCurrentMax = aNewMax;
+	free(old_shk);
+	free(old_hotkey_up);
+	return true;
+}
+
+
+
+HotkeyIDType &CustomComboLast(HotkeyIDType *aFirst)
+{
+	for (; *aFirst != HOTKEY_ID_INVALID; aFirst = &Hotkey::shk[*aFirst]->mNextCustomCombo);
+	return *aFirst;
+}
+
+void LinkKeysForCustomCombo(vk_type aNeutral, vk_type aLeft, vk_type aRight)
+{
+	HotkeyIDType first_neutral = kvk[aNeutral].first_custom_combo;
+	if (first_neutral == HOTKEY_ID_INVALID)
+		return;
+	// Append the neutral key's list to the lists of the left and right keys.
+	CustomComboLast(&kvk[aLeft].first_custom_combo) = first_neutral;
+	CustomComboLast(&kvk[aRight].first_custom_combo) = first_neutral;
 }
 
 
@@ -4140,11 +4092,6 @@ void AddRemoveHooks(HookType aHooksToBeActive, bool aChangeIsTemporary)
 	HookType hooks_active_orig = GetActiveHooks();
 	if (aHooksToBeActive == hooks_active_orig) // It's already in the right state.
 		return;
-
-	// It's done the following way because:
-	// It's unclear that zero is always an invalid thread ID (not even GetWindowThreadProcessId's
-	// documentation gives any hint), so its safer to assume that a thread ID can be zero and yet still valid.
-	static HANDLE sThreadHandle = NULL;
 
 	if (!hooks_active_orig) // Neither hook is active now but at least one will be or the above would have returned.
 	{
@@ -4367,7 +4314,7 @@ bool SystemHasAnotherKeybdHook()
 	// we want a handle to the mutex maintained here.
 	if (sKeybdMutex) // It was open originally, so update the handle the the newly opened one.
 		sKeybdMutex = mutex;
-	else // Keep it closed because the system tracks how many handles there are, deleting the mutex when zero.
+	else if (mutex) // Keep it closed because the system tracks how many handles there are, deleting the mutex when zero.
 		CloseHandle(mutex);  // This facilitates other instances of the program getting the proper last_error value.
 	return last_error == ERROR_ALREADY_EXISTS;
 }
@@ -4384,7 +4331,7 @@ bool SystemHasAnotherMouseHook()
 	// we want a handle to the mutex maintained here.
 	if (sMouseMutex) // It was open originally, so update the handle the the newly opened one.
 		sMouseMutex = mutex;
-	else // Keep it closed because the system tracks how many handles there are, deleting the mutex when zero.
+	else if (mutex) // Keep it closed because the system tracks how many handles there are, deleting the mutex when zero.
 		CloseHandle(mutex);  // This facilitates other instances of the program getting the proper last_error value.
 	return last_error == ERROR_ALREADY_EXISTS;
 }
@@ -4470,6 +4417,10 @@ DWORD WINAPI HookThreadProc(LPVOID aUnused)
 				// full responsibility for freeing the hook's memory.
 			break;
 
+		case AHK_HOOK_SYNC:
+			sHookSyncd = true;
+			break;
+
 		} // switch (msg.message)
 	} // for(;;)
 }
@@ -4530,17 +4481,15 @@ void ResetHook(bool aAllModifiersUp, HookType aWhichHook, bool aResetKVKandKSC)
 
 		ZeroMemory(g_PhysicalKeyState, sizeof(g_PhysicalKeyState));
 
-		sDisguiseNextLWinUp = false;
-		sDisguiseNextRWinUp = false;
-		sDisguiseNextLAltUp = false;
-		sDisguiseNextRAltUp = false;
+		sDisguiseNextMenu = false;
+		sUndisguisedMenuInEffect = false;
 		sAltTabMenuIsVisible = (FindWindow(_T("#32771"), NULL) != NULL); // I've seen indications that MS wants this to work on all operating systems.
 
 		ZeroMemory(sPadState, sizeof(sPadState));
 
 		*g_HSBuf = '\0';
 		g_HSBufLength = 0;
-		g_HShwnd = GetForegroundWindow(); // Not needed by some callers, but shouldn't hurt even then.
+		g_HShwnd = 0; // It isn't necessary to determine the actual window/control at this point since the buffer is already empty.
 
 		// Variables for the Shift+Numpad workaround:
 		sNextPhysShiftDownIsNotPhys = false;
@@ -4607,7 +4556,7 @@ void FreeHookMem()
 	}
 	if (hotkey_up)
 	{
-		delete [] hotkey_up;
+		free(hotkey_up);
 		hotkey_up = NULL;
 	}
 }
@@ -4698,4 +4647,18 @@ void GetHookStatus(LPTSTR aBuf, int aBufSize)
 					);
 		}
 	}
+}
+
+
+
+void WaitHookIdle()
+// Wait until the hook has reached a known idle state (i.e. finished any processing
+// that it was in the middle of, though it could start something new immediately after).
+{
+	if (!sThreadHandle)
+		return;
+	sHookSyncd = false;
+	PostThreadMessage(g_HookThreadID, AHK_HOOK_SYNC, 0, 0);
+	while (!sHookSyncd)
+		SLEEP_WITHOUT_INTERRUPTION(0);
 }

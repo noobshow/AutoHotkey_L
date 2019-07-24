@@ -47,6 +47,8 @@ extern modLR_type g_modifiersLR_logical;   // Tracked by hook (if hook is active
 extern modLR_type g_modifiersLR_logical_non_ignored;
 extern modLR_type g_modifiersLR_physical;  // Same as above except it's which modifiers are PHYSICALLY down.
 
+extern key_type *pPrefixKey;
+
 #ifdef FUTURE_USE_MOUSE_BUTTONS_LOGICAL
 extern WORD g_mouse_buttons_logical; // A bitwise combination of MK_LBUTTON, etc.
 #endif
@@ -59,7 +61,8 @@ extern DWORD g_HookReceiptOfLControlMeansAltGr;
 extern DWORD g_IgnoreNextLControlDown;
 extern DWORD g_IgnoreNextLControlUp;
 
-extern BYTE g_MenuMaskKey; // L38: See #MenuMaskKey.
+extern BYTE g_MenuMaskKeyVK; // For #MenuMaskKey.
+extern USHORT g_MenuMaskKeySC;
 
 // If a SendKeys() operation takes longer than this, hotkey's modifiers won't be pressed back down:
 extern int g_HotkeyModifierTimeout;
@@ -75,6 +78,7 @@ extern WarnMode g_Warn_UseUnsetLocal;
 extern WarnMode g_Warn_UseUnsetGlobal;
 extern WarnMode g_Warn_UseEnv;
 extern WarnMode g_Warn_LocalSameAsGlobal;
+extern WarnMode g_Warn_ClassOverwrite;
 extern SingleInstanceType g_AllowOnlyOneInstance;
 extern bool g_persistent;
 extern bool g_NoTrayIcon;
@@ -104,18 +108,13 @@ extern int g_MaxHotkeysPerInterval;
 extern int g_HotkeyThrottleInterval;
 extern bool g_MaxThreadsBuffer;
 extern SendLevelType g_InputLevel;
-extern HotCriterionType g_HotCriterion;
-extern LPTSTR g_HotWinTitle;
-extern LPTSTR g_HotWinText;
+extern HotkeyCriterion *g_HotCriterion;
 extern HotkeyCriterion *g_FirstHotCriterion, *g_LastHotCriterion;
 
 // Global variables for #if (expression). See globaldata.cpp for comments.
-extern int g_HotExprIndex;
-extern Line **g_HotExprLines;
-extern int g_HotExprLineCount;
-extern int g_HotExprLineCountMax;
 extern UINT g_HotExprTimeout;
 extern HWND g_HotExprLFW;
+extern HotkeyCriterion *g_FirstHotExpr, *g_LastHotExpr;
 
 extern int g_ScreenDPI;
 extern MenuTypeType g_MenuIsVisible;
@@ -150,15 +149,16 @@ extern HWND g_HShwnd;
 extern int g_HSPriority;
 extern int g_HSKeyDelay;
 extern SendModes g_HSSendMode;
+extern SendRawType g_HSSendRaw;
 extern bool g_HSCaseSensitive;
 extern bool g_HSConformToCase;
 extern bool g_HSDoBackspace;
 extern bool g_HSOmitEndChar;
-extern bool g_HSSendRaw;
 extern bool g_HSEndCharRequired;
 extern bool g_HSDetectWhenInsideWord;
 extern bool g_HSDoReset;
 extern bool g_HSResetUponMouseClick;
+extern bool g_HSSameLineAction;
 extern TCHAR g_EndChars[HS_MAX_END_CHARS + 1];
 
 // Global objects:
@@ -205,6 +205,8 @@ extern DWORD g_HistoryTickNow;
 extern DWORD g_HistoryTickPrev;
 extern HWND g_HistoryHwndPrev;
 extern DWORD g_TimeLastInputPhysical;
+extern DWORD g_TimeLastInputKeyboard;
+extern DWORD g_TimeLastInputMouse;
 
 #ifdef ENABLE_KEY_HISTORY_FILE
 extern bool g_KeyHistoryToFile;

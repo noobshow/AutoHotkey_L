@@ -805,8 +805,7 @@ bool MsgSleep(int aSleepDuration, MessageMode aMode)
 				if (hs->mHotCriterion)
 				{
 					// For details, see comments in the hotkey section of this switch().
-					// L4: Added hs->mHotExprIndex for #if (expression).
-					if (   !(criterion_found_hwnd = HotCriterionAllowsFiring(hs->mHotCriterion, hs->mHotWinTitle, hs->mHotWinText, hs->mHotExprIndex, hs->mJumpToLabel ? hs->mJumpToLabel->mName : _T("")))   )
+					if (   !(criterion_found_hwnd = HotCriterionAllowsFiring(hs->mHotCriterion, hs->mName))   )
 						// Hotstring is no longer eligible to fire even though it was when the hook sent us
 						// the message.  Abort the firing even though the hook may have already started
 						// executing the hotstring by suppressing the final end-character or other actions.
@@ -814,7 +813,7 @@ bool MsgSleep(int aSleepDuration, MessageMode aMode)
 						// keystrokes to the wrong window, or when the hotstring has become suspended.
 						continue;
 					// For details, see comments in the hotkey section of this switch().
-					if (!(hs->mHotCriterion == HOT_IF_ACTIVE || hs->mHotCriterion == HOT_IF_EXIST))
+					if (!(hs->mHotCriterion->Type == HOT_IF_ACTIVE || hs->mHotCriterion->Type == HOT_IF_EXIST))
 						criterion_found_hwnd = NULL; // For "NONE" and "NOT", there is no last found window.
 				}
 				else // No criterion, so it's a global hotstring.  It can always fire, but it has no "last found window".
@@ -824,7 +823,7 @@ bool MsgSleep(int aSleepDuration, MessageMode aMode)
 				// below.  But also do the backspacing (if specified) for a non-autoreplace hotstring,
 				// even if it can't launch due to MaxThreads, MaxThreadsPerHotkey, or some other reason:
 				hs->DoReplace(msg.lParam);  // Does only the backspacing if it's not an auto-replace hotstring.
-				if (*hs->mReplacement) // Fully handled by the above; i.e. it's an auto-replace hotstring.
+				if (hs->mReplacement) // Fully handled by the above; i.e. it's an auto-replace hotstring.
 					continue;
 				// Otherwise, continue on and let a new thread be created to handle this hotstring.
 				// Since this isn't an auto-replace hotstring, set this value to support
@@ -929,9 +928,10 @@ bool MsgSleep(int aSleepDuration, MessageMode aMode)
 				}
 
 				// Now that above has ensured variant is non-NULL:
-				if (variant->mHotCriterion == HOT_IF_NOT_ACTIVE || variant->mHotCriterion == HOT_IF_NOT_EXIST)
+				HotkeyCriterion *hc = variant->mHotCriterion;
+				if (!hc || hc->Type == HOT_IF_NOT_ACTIVE || hc->Type == HOT_IF_NOT_EXIST)
 					criterion_found_hwnd = NULL; // For "NONE" and "NOT", there is no last found window.
-				else if (variant->mHotCriterion == HOT_IF_EXPR) // Variants of this type may 
+				else if (HOT_IF_REQUIRES_EVAL(hc->Type))
 					criterion_found_hwnd = g_HotExprLFW; // For #if WinExist(WinTitle) and similar.
 
 				label_to_call = variant->mJumpToLabel;
@@ -1025,7 +1025,7 @@ bool MsgSleep(int aSleepDuration, MessageMode aMode)
 				// Unlike hotkeys -- which can have a name independent of their label by being created or updated
 				// with the HOTKEY command -- a hot string's unique name is always its label since that includes
 				// the options that distinguish between (for example) :c:ahk:: and ::ahk::
-				g_script.mThisHotkeyName = (msg.message == AHK_HOTSTRING) ? hs->mJumpToLabel->mName : hk->mName;
+				g_script.mThisHotkeyName = (msg.message == AHK_HOTSTRING) ? hs->mName : hk->mName;
 				g_script.mThisHotkeyStartTime = GetTickCount(); // Fixed for v1.0.35.10 to not happen for GUI threads.
 			}
 
@@ -1484,7 +1484,7 @@ bool MsgSleep(int aSleepDuration, MessageMode aMode)
 			// The app normally terminates before WM_QUIT is ever seen here because of the way
 			// WM_CLOSE is handled by MainWindowProc().  However, this is kept here in case anything
 			// external ever explicitly posts a WM_QUIT to our thread's queue:
-			g_script.ExitApp(EXIT_WM_QUIT);
+			g_script.ExitApp(EXIT_CLOSE);
 			continue; // Since ExitApp() won't necessarily exit.
 		} // switch()
 break_out_of_main_switch:
@@ -1960,6 +1960,7 @@ bool MsgMonitor(MsgMonitorInstance &aInstance, HWND aWnd, UINT aMsg, WPARAM awPa
 	if (pgui) // i.e. we set g->GuiWindow and g->GuiDefaultWindow above.
 	{
 		pgui->Release(); // g->GuiWindow
+		g->GuiWindow = NULL; // In case of an OnError callback, which would execute on the same thread.
 		//g->GuiDefaultWindow->Release(); // This is done by ResumeUnderlyingThread().
 	}
 
@@ -2098,16 +2099,14 @@ void InitNewThread(int aPriority, bool aSkipUninterruptible, bool aIncrementThre
 
 void ResumeUnderlyingThread(LPTSTR aSavedErrorLevel)
 {
+	if (g->ThrownToken)
+		g_script.FreeExceptionToken(g->ThrownToken);
+
 	// These two may be set by any thread, so must be released here:
 	if (g->GuiDefaultWindow)
 		g->GuiDefaultWindow->Release();
 	if (g->DialogOwner)
 		g->DialogOwner->Release();
-
-	// Check if somebody has thrown an exception and it's not been caught yet
-	if (g->ThrownToken)
-		// Display an error message
-		g_script.UnhandledException(g->ThrownToken, g->ExcptLine);
 
 	// The following section handles the switch-over to the former/underlying "g" item:
 	--g_nThreads; // Other sections below might rely on this having been done early.
@@ -2216,14 +2215,14 @@ VOID CALLBACK MsgBoxTimeout(HWND hWnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime
 	// v1.0.33: The following was added to fix the fact that a MsgBox with only an OK button
 	// does not actually send back the code sent by EndDialog() above.  The HWND is checked
 	// in case "g" is no longer the original thread due to another thread having interrupted it.
-	// Consequently, MsgBox's with an OK button won't be 100% reliable with the timeout feature
-	// if an interrupting thread is running at the time the box times out.  This is in the help
-	// file as a known limitation.  Perhaps in the future it can be solved by setting some new
-	// member of "g" that tells ResumeUnderlyingThread() to keep passing back "hWnd" as threads
-	// are resumed until the thread whose g->DialogHWND matches that hwnd.  That thread's
-	// g->MsgBoxTimedOut could then be set to true just before the thread is resumed.
-	if (g->DialogHWND == hWnd) // Regardless of whether IsWindow() is true.  See also: above comment.
-		g->MsgBoxTimedOut = true;
+	// v1.1.30.01: The loop was added so that the timeout can be detected even if the thread
+	// which owns the dialog was interrupted.
+	for (auto *dialog_g = g; dialog_g >= g_array; --dialog_g)
+		if (dialog_g->DialogHWND == hWnd) // Regardless of whether IsWindow() is true.
+		{
+			dialog_g->MsgBoxTimedOut = true;
+			break;
+		}
 }
 
 

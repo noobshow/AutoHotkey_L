@@ -37,7 +37,8 @@ enum UserMessages {AHK_HOOK_HOTKEY = WM_USER, AHK_HOTSTRING, AHK_USER_MENU, AHK_
 	// start of a range used by other common controls too).  So trying a higher number that's (hopefully) very
 	// unlikely to be used by OS features.
 	, AHK_CLIPBOARD_CHANGE, AHK_HOOK_TEST_MSG, AHK_CHANGE_HOOK_STATE, AHK_GETWINDOWTEXT
-	, AHK_HOT_IF_EXPR	// L4: HotCriterionAllowsFiring uses this to ensure expressions are evaluated only on the main thread.
+	, AHK_HOT_IF_EVAL	// HotCriterionAllowsFiring uses this to ensure expressions are evaluated only on the main thread.
+	, AHK_HOOK_SYNC // For WaitHookIdle().
 };
 // NOTE: TRY NEVER TO CHANGE the specific numbers of the above messages, since some users might be
 // using the Post/SendMessage commands to automate AutoHotkey itself.  Here is the original order
@@ -118,10 +119,11 @@ struct sc_hotkey
 struct key_type
 {
 	ToggleValueType *pForceToggle;  // Pointer to a global variable for toggleable keys only.  NULL for others.
-	modLR_type as_modifiersLR; // If this key is a modifier, this will have the corresponding bit(s) for that key.
-	HotkeyIDType hotkey_to_fire_upon_release; // A up-event hotkey queued by a prior down-event.
 	// Keep sub-32-bit members contiguous to save memory without having to sacrifice performance of
 	// 32-bit alignment:
+	HotkeyIDType hotkey_to_fire_upon_release; // A up-event hotkey queued by a prior down-event.
+	HotkeyIDType first_custom_combo; // The first custom combo hotkey using this key as a suffix.
+	modLR_type as_modifiersLR; // If this key is a modifier, this will have the corresponding bit(s) for that key.
 	#define PREFIX_ACTUAL 1 // Values for used_as_prefix below, for places that need to distinguish between type of prefix.
 	#define PREFIX_FORCED 2 // v1.0.44: Added so that a neutral hotkey like Control can be forced to fire on key-up even though it isn't actually a prefix key.
 	UCHAR used_as_prefix; // Whether a given virtual key or scan code is even used by a hotkey.
@@ -139,13 +141,6 @@ struct key_type
 	#define AS_PREFIX 1
 	#define AS_PREFIX_FOR_HOTKEY 2
 	bool sc_takes_precedence; // used only by the scan code array: this scan code should take precedence over vk.
-	UCHAR nModifierVK;
-	UCHAR nModifierSC;
-	// User is likely to use more modifying vks than we do sc's, since sc's are rare:
-	#define MAX_MODIFIER_VKS_PER_SUFFIX 50
-	#define MAX_MODIFIER_SCS_PER_SUFFIX 16
-	vk_hotkey ModifierVK[MAX_MODIFIER_VKS_PER_SUFFIX];
-	sc_hotkey ModifierSC[MAX_MODIFIER_SCS_PER_SUFFIX];
 }; // Keep the macro below in sync with the above.
 
 // Fix for v1.0.43.01: Caller wants item.no_suppress initialized to remove all flags except NO_SUPPRESS_STATES.
@@ -155,8 +150,7 @@ struct key_type
 //   RButton::return
 #define RESET_KEYTYPE_ATTRIB(item) \
 {\
-	item.nModifierVK = 0;\
-	item.nModifierSC = 0;\
+	item.first_custom_combo = HOTKEY_ID_INVALID;\
 	item.used_as_prefix = 0;\
 	item.used_as_suffix = false;\
 	item.used_as_key_up = false;\
@@ -247,13 +241,13 @@ LRESULT SuppressThisKeyFunc(const HHOOK aHook, LPARAM lParam, const vk_type aVK,
 	, bool aKeyUp, KeyHistoryItem *pKeyHistoryCurr, WPARAM aHotkeyIDToPost
 	, WPARAM aHSwParamToPost = HOTSTRING_INDEX_INVALID, LPARAM aHSlParamToPost = 0);
 
-#define AllowKeyToGoToSystem AllowIt(aHook, aCode, wParam, lParam, aVK, aSC, aKeyUp, pKeyHistoryCurr, hotkey_id_to_post, false)
-#define AllowKeyToGoToSystemButDisguiseWinAlt AllowIt(aHook, aCode, wParam, lParam, aVK, aSC, aKeyUp, pKeyHistoryCurr, hotkey_id_to_post, true)
+#define AllowKeyToGoToSystem AllowIt(aHook, aCode, wParam, lParam, aVK, aSC, aKeyUp, pKeyHistoryCurr, hotkey_id_to_post)
 LRESULT AllowIt(const HHOOK aHook, int aCode, WPARAM wParam, LPARAM lParam, const vk_type aVK, const sc_type aSC
-	, bool aKeyUp, KeyHistoryItem *pKeyHistoryCurr, WPARAM aHotkeyIDToPost, bool aDisguiseWinAlt);
+	, bool aKeyUp, KeyHistoryItem *pKeyHistoryCurr, WPARAM aHotkeyIDToPost);
 
 bool CollectInput(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC, bool aKeyUp, bool aIsIgnored
 	, KeyHistoryItem *pKeyHistoryCurr, WPARAM &aHotstringWparamToPost, LPARAM &aHotstringLparamToPost);
+bool IsHotstringWordChar(TCHAR aChar);
 void UpdateKeybdState(KBDLLHOOKSTRUCT &aEvent, const vk_type aVK, const sc_type aSC, bool aKeyUp, bool aIsSuppressed);
 bool KeybdEventIsPhysical(DWORD aEventFlags, const vk_type aVK, bool aKeyUp);
 bool DualStateNumpadKeyIsDown();
@@ -261,9 +255,12 @@ bool IsDualStateNumpadKey(const vk_type aVK, const sc_type aSC);
 
 void ChangeHookState(Hotkey *aHK[], int aHK_count, HookType aWhichHook, HookType aWhichHookAlways);
 void AddRemoveHooks(HookType aHooksToBeActive, bool aChangeIsTemporary = false);
+bool HookAdjustMaxHotkeys(Hotkey **&aHK, int &aCurrentMax, int aNewMax);
 bool SystemHasAnotherKeybdHook();
 bool SystemHasAnotherMouseHook();
 DWORD WINAPI HookThreadProc(LPVOID aUnused);
+
+void LinkKeysForCustomCombo(vk_type aNeutral, vk_type aLeft, vk_type aRight);
 
 void ResetHook(bool aAllModifiersUp = false, HookType aWhichHook = (HOOK_KEYBD | HOOK_MOUSE)
 	, bool aResetKVKandKSC = false);
@@ -271,5 +268,7 @@ HookType GetActiveHooks();
 void FreeHookMem();
 void ResetKeyTypeState(key_type &key);
 void GetHookStatus(LPTSTR aBuf, int aBufSize);
+
+void WaitHookIdle();
 
 #endif

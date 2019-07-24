@@ -64,7 +64,8 @@ DWORD g_HookReceiptOfLControlMeansAltGr = 0; // In these cases, zero is used as 
 DWORD g_IgnoreNextLControlDown = 0;          //
 DWORD g_IgnoreNextLControlUp = 0;            //
 
-BYTE g_MenuMaskKey = VK_CONTROL; // L38: See #MenuMaskKey.
+BYTE g_MenuMaskKeyVK = VK_CONTROL; // For #MenuMaskKey.
+USHORT g_MenuMaskKeySC = SC_LCONTROL;
 
 int g_HotkeyModifierTimeout = 50;  // Reduced from 100, which was a little too large for fast typists.
 int g_ClipboardTimeout = 1000; // v1.0.31
@@ -79,6 +80,7 @@ WarnMode g_Warn_UseUnsetLocal = WARNMODE_OFF;		// Used by #Warn directive.
 WarnMode g_Warn_UseUnsetGlobal = WARNMODE_OFF;		//
 WarnMode g_Warn_UseEnv = WARNMODE_OFF;				//
 WarnMode g_Warn_LocalSameAsGlobal = WARNMODE_OFF;	//
+WarnMode g_Warn_ClassOverwrite = WARNMODE_OFF;		//
 SingleInstanceType g_AllowOnlyOneInstance = ALLOW_MULTI_INSTANCE;
 bool g_persistent = false;  // Whether the script should stay running even after the auto-exec section finishes.
 bool g_NoTrayIcon = false;
@@ -116,18 +118,13 @@ int g_MaxHotkeysPerInterval = 70; // Increased to 70 because 60 was still causin
 int g_HotkeyThrottleInterval = 2000; // Milliseconds.
 bool g_MaxThreadsBuffer = false;  // This feature usually does more harm than good, so it defaults to OFF.
 SendLevelType g_InputLevel = 0;
-HotCriterionType g_HotCriterion = HOT_NO_CRITERION;
-LPTSTR g_HotWinTitle = _T(""); // In spite of the above being the primary indicator,
-LPTSTR g_HotWinText = _T("");  // these are initialized for maintainability.
+HotkeyCriterion *g_HotCriterion = NULL; // The current criterion for new hotkeys.
 HotkeyCriterion *g_FirstHotCriterion = NULL, *g_LastHotCriterion = NULL;
 
 // Global variables for #if (expression).
-int g_HotExprIndex = -1; // The index of the Line containing the expression defined by the most recent #if (expression) directive.
-Line **g_HotExprLines = NULL; // Array of pointers to expression lines, allocated when needed.
-int g_HotExprLineCount = 0; // Number of expression lines currently present.
-int g_HotExprLineCountMax = 0; // Current capacity of g_HotExprLines.
 UINT g_HotExprTimeout = 1000; // Timeout for #if (expression) evaluation, in milliseconds.
 HWND g_HotExprLFW = NULL; // Last Found Window of last #if expression.
+HotkeyCriterion *g_FirstHotExpr = NULL, *g_LastHotExpr = NULL;
 
 static int GetScreenDPI()
 {
@@ -175,15 +172,16 @@ HWND g_HShwnd;
 int g_HSPriority = 0;  // default priority is always 0
 int g_HSKeyDelay = 0;  // Fast sends are much nicer for auto-replace and auto-backspace.
 SendModes g_HSSendMode = SM_INPUT; // v1.0.43: New default for more reliable hotstrings.
+SendRawType g_HSSendRaw = SCM_NOT_RAW;
 bool g_HSCaseSensitive = false;
 bool g_HSConformToCase = true;
 bool g_HSDoBackspace = true;
 bool g_HSOmitEndChar = false;
-bool g_HSSendRaw = false;
 bool g_HSEndCharRequired = true;
 bool g_HSDetectWhenInsideWord = false;
 bool g_HSDoReset = false;
 bool g_HSResetUponMouseClick = true;
+bool g_HSSameLineAction = false;
 TCHAR g_EndChars[HS_MAX_END_CHARS + 1] = _T("-()[]{}:;'\"/\\,.?!\n \t");  // Hotstring default end chars, including a space.
 // The following were considered but seemed too rare and/or too likely to result in undesirable replacements
 // (such as while programming or scripting, or in usernames or passwords): <>*+=_%^&|@#$|
@@ -794,3 +792,5 @@ HWND g_HistoryHwndPrev = NULL;
 
 // Also hook related:
 DWORD g_TimeLastInputPhysical = GetTickCount();
+DWORD g_TimeLastInputKeyboard = g_TimeLastInputPhysical;
+DWORD g_TimeLastInputMouse = g_TimeLastInputPhysical;

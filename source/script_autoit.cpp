@@ -297,7 +297,17 @@ ResultType Line::WinMenuSelectItem(LPTSTR aTitle, LPTSTR aText, LPTSTR aMenu1, L
 	if (!target_window)
 		goto error;
 
-	HMENU hMenu = GetMenu(target_window);
+	int first_menu_param = 0;
+	UINT message = WM_COMMAND;
+	HMENU hMenu;
+	if (!_tcsicmp(aMenu1, _T("0&")))
+	{
+		hMenu = GetSystemMenu(target_window, FALSE);
+		first_menu_param = 1;
+		message = WM_SYSCOMMAND;
+	}
+	else
+		hMenu = GetMenu(target_window);
 	if (!hMenu) // Window has no menu bar.
 		goto error;
 
@@ -323,7 +333,7 @@ else\
 	int pos, target_menu_pos;
 	LPTSTR this_menu_param;
 
-	for (int i = 0; ; ++i)
+	for (int i = first_menu_param; ; ++i)
 	{
 		this_menu_param = menu_param[i]; // For performance and convenience.
 		if (!(this_menu_param && *this_menu_param))
@@ -382,7 +392,7 @@ else\
 		goto error;
 
 	// Since the above didn't return, the specified search hierarchy was completely found.
-	PostMessage(target_window, WM_COMMAND, (WPARAM)menu_id, 0);
+	PostMessage(target_window, message, (WPARAM)menu_id, 0);
 	return g_ErrorLevel->Assign(ERRORLEVEL_NONE); // Indicate success.
 
 error:
@@ -606,18 +616,7 @@ ResultType Line::Control(LPTSTR aCmd, LPTSTR aValue, LPTSTR aControl, LPTSTR aTi
 				goto error;
 		if (dwResult == CB_ERR)  // CB_ERR == LB_ERR
 			goto error;
-		if (   !(immediate_parent = GetParent(control_window))   )
-			goto error;
-		if (   !(control_id = GetDlgCtrlID(control_window))   )
-			goto error;
-		if (!SendMessageTimeout(immediate_parent, WM_COMMAND, (WPARAM)MAKELONG(control_id, x_msg)
-			, (LPARAM)control_window, SMTO_ABORTIFHUNG, 2000, &dwResult))
-			goto error;
-		if (!SendMessageTimeout(immediate_parent, WM_COMMAND, (WPARAM)MAKELONG(control_id, y_msg)
-			, (LPARAM)control_window, SMTO_ABORTIFHUNG, 2000, &dwResult))
-			goto error;
-		// Otherwise break and do the end-function processing.
-		break;
+		goto notify_parent;
 
 	case CONTROL_CMD_CHOOSESTRING:
 		if (!*aControl) // Fix for v1.0.46.11: If aControl is blank, the control ID came in via a WinTitle of "ahk_id xxx".
@@ -652,13 +651,18 @@ ResultType Line::Control(LPTSTR aCmd, LPTSTR aValue, LPTSTR aControl, LPTSTR aTi
 				goto error;
 		}
 		else // ComboBox or single-select ListBox.
-			if (!SendMessageTimeout(control_window, msg, 1, (LPARAM)aValue, SMTO_ABORTIFHUNG, 2000, &dwResult)
+			if (!SendMessageTimeout(control_window, msg, -1, (LPARAM)aValue, SMTO_ABORTIFHUNG, 2000, &dwResult)
 				|| dwResult == CB_ERR) // CB_ERR == LB_ERR
 				goto error;
+	notify_parent:
 		if (   !(immediate_parent = GetParent(control_window))   )
 			goto error;
-		if (   !(control_id = GetDlgCtrlID(control_window))   )
-			goto error;
+		SetLastError(0); // Must be done to differentiate between success and failure when control has ID 0.
+		control_id = GetDlgCtrlID(control_window);
+		if (!control_id && GetLastError()) // Both conditions must be checked (see above).
+			goto error; // Avoid sending the notification in case some other control has ID 0.
+		// Proceed even if control_id == 0, since some applications are known to
+		// utilize the notification in that case (e.g. Notepad's Save As dialog).
 		if (!SendMessageTimeout(immediate_parent, WM_COMMAND, (WPARAM)MAKELONG(control_id, x_msg)
 			, (LPARAM)control_window, SMTO_ABORTIFHUNG, 2000, &dwResult))
 			goto error;
@@ -742,7 +746,7 @@ ResultType Line::ControlGet(LPTSTR aCmd, LPTSTR aValue, LPTSTR aControl, LPTSTR 
 			msg = LB_FINDSTRINGEXACT;
 		else // Must be ComboBox or ListBox
 			goto error;
-		if (!SendMessageTimeout(control_window, msg, 1, (LPARAM)aValue, SMTO_ABORTIFHUNG, 2000, &index)
+		if (!SendMessageTimeout(control_window, msg, -1, (LPARAM)aValue, SMTO_ABORTIFHUNG, 2000, &index)
 			|| index == CB_ERR) // CB_ERR == LB_ERR
 			goto error;
 		output_var.Assign(index + 1);

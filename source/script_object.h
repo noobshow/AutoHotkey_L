@@ -13,6 +13,7 @@ enum ObjectMethodID { // Partially ported from v2 BuiltInFunctionID.  Used for c
 	FID_ObjInsertAt, FID_ObjDelete, FID_ObjRemoveAt, FID_ObjPush, FID_ObjPop, FID_ObjLength
 	, FID_ObjHasKey, FID_ObjGetCapacity, FID_ObjSetCapacity, FID_ObjGetAddress, FID_ObjClone
 	, FID_ObjNewEnum, FID_ObjMaxIndex, FID_ObjMinIndex, FID_ObjRemove, FID_ObjInsert
+	, FID_ObjCount
 };
 
 
@@ -95,6 +96,7 @@ public:
 	Property() : mGet(NULL), mSet(NULL) { }
 	
 	ResultType STDMETHODCALLTYPE Invoke(ExprTokenType &aResultToken, ExprTokenType &aThisToken, int aFlags, ExprTokenType *aParam[], int aParamCount);
+	IObject_Type_Impl("Property")
 };
 
 
@@ -152,6 +154,7 @@ protected:
 		Enumerator(Object *aObject) : mObject(aObject), mOffset(-1) { mObject->AddRef(); }
 		~Enumerator() { mObject->Release(); }
 		int Next(Var *aKey, Var *aVal);
+		IObject_Type_Impl("Object.Enumerator")
 	};
 	
 	IObject *mBase;
@@ -200,6 +203,7 @@ protected:
 public:
 	static Object *Create(ExprTokenType *aParam[] = NULL, int aParamCount = 0);
 	static Object *CreateArray(ExprTokenType *aValue[] = NULL, int aValueCount = 0);
+	static Object *CreateFromArgV(LPTSTR *aArgV, int aArgC);
 
 	bool Append(LPTSTR aValue, size_t aValueLength = -1);
 
@@ -230,21 +234,27 @@ public:
 	{
 		return (int)mKeyOffsetObject;
 	}
-	
-	bool GetItem(ExprTokenType &aToken, LPTSTR aKey)
+
+	bool GetItem(ExprTokenType &aToken, ExprTokenType &aKey)
 	{
-		KeyType key;
-		SymbolType key_type = IsPureNumeric(aKey, FALSE, FALSE, FALSE); // SYM_STRING or SYM_INTEGER.
-		if (key_type == SYM_INTEGER)
-			key.i = ATOI(aKey);
-		else
-			key.s = aKey;
 		IndexType insert_pos;
-		FieldType *field = FindField(key_type, key, insert_pos);
+		TCHAR buf[MAX_NUMBER_SIZE];
+		SymbolType key_type;
+		KeyType key;
+		FieldType *field = FindField(aKey, buf, key_type, key, insert_pos);
 		if (!field)
 			return false;
 		field->ToToken(aToken);
 		return true;
+	}
+	
+	bool GetItem(ExprTokenType &aToken, LPTSTR aKey)
+	{
+		ExprTokenType key;
+		key.symbol = SYM_OPERAND;
+		key.marker = aKey;
+		key.buf = NULL;
+		return GetItem(aToken, key);
 	}
 	
 	bool SetItem(ExprTokenType &aKey, ExprTokenType &aValue)
@@ -308,6 +318,7 @@ public:
 		return mBase; // Callers only want to call Invoke(), so no AddRef is done.
 	}
 	
+	LPTSTR Type();
 	// Used by Object::_Insert() and Func::Call():
 	bool InsertAt(INT_PTR aOffset, INT_PTR aKey, ExprTokenType *aValue[], int aValueCount);
 
@@ -333,6 +344,7 @@ public:
 	ResultType _GetCapacity(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
 	ResultType _SetCapacity(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
 	ResultType _GetAddress(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
+	ResultType _Count(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
 	ResultType _Length(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
 	ResultType _MaxIndex(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
 	ResultType _MinIndex(ExprTokenType &aResultToken, ExprTokenType *aParam[], int aParamCount);
@@ -385,6 +397,7 @@ public:
 	~BoundFunc();
 
 	ResultType STDMETHODCALLTYPE Invoke(ExprTokenType &aResultToken, ExprTokenType &aThisToken, int aFlags, ExprTokenType *aParam[], int aParamCount);
+	IObject_Type_Impl("BoundFunc")
 };
 
 
@@ -426,6 +439,7 @@ public:
 		, int aPatternCount, int aCapturedPatternCount, LPCTSTR aMark);
 	
 	ResultType STDMETHODCALLTYPE Invoke(ExprTokenType &aResultToken, ExprTokenType &aThisToken, int aFlags, ExprTokenType *aParam[], int aParamCount);
+	IObject_Type_Impl("RegExMatch")
 
 #ifdef CONFIG_DEBUGGER
 	void DebugWriteProperty(IDebugProperties *, int aPage, int aPageSize, int aDepth);

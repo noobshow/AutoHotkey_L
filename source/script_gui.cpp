@@ -218,6 +218,7 @@ ResultType Script::PerformGui(LPTSTR aBuf, LPTSTR aParam2, LPTSTR aParam3, LPTST
 			// a full GuiType structure is constructed.  We can't actually create the Gui yet,
 			// since that would prevent +Owner%N% from working and possibly break other scripts
 			// which rely on the old behaviour.
+			if (  (GuiType::sFont || (GuiType::sFont = (FontType *)malloc(sizeof(FontType) * MAX_GUI_FONTS)))  ) // See similar line below for comments regarding sFont.
 			if (pgui = new GuiType())
 			{
 				if (pgui->mName = tmalloc(name_length + 1))
@@ -317,6 +318,11 @@ ResultType Script::PerformGui(LPTSTR aBuf, LPTSTR aParam2, LPTSTR aParam3, LPTST
 		// Otherwise: Create the object and (later) its window, since all the other sub-commands below need it:
 		for (;;) // For break, to reduce repetition of cleanup-on-failure code.
 		{
+			// v1.0.44.14: sFont is created upon first use to conserve ~14 KB memory in non-GUI scripts.
+			// v1.1.29.00: sFont is created here rather than in FindOrCreateFont(), which is called by
+			// the constructor below, to avoid the need to add extra logic in several places to detect
+			// a failed/NULL array.  Previously that was done by simply terminating the script.
+			if (  (GuiType::sFont || (GuiType::sFont = (FontType *)malloc(sizeof(FontType) * MAX_GUI_FONTS)))  )
 			if (pgui = new GuiType())
 			{
 				if (pgui->mControl = (GuiControlType *)malloc(GUI_CONTROL_BLOCK_SIZE * sizeof(GuiControlType)))
@@ -333,7 +339,7 @@ ResultType Script::PerformGui(LPTSTR aBuf, LPTSTR aParam2, LPTSTR aParam3, LPTST
 				}
 				delete pgui;
 			}
-			result = FAIL; // No error displayed since extremely rare.
+			result = ScriptError(ERR_OUTOFMEM);
 			goto return_the_result;
 		}
 	}
@@ -1498,7 +1504,7 @@ ResultType Line::GuiControlGet(LPTSTR aCommand, LPTSTR aControlID, LPTSTR aParam
 		// var names that are too long:
 		TCHAR var_name[MAX_VAR_NAME_LENGTH + 20];
 		Var *var;
-		int always_use = output_var.IsLocal() ? FINDVAR_LOCAL : FINDVAR_GLOBAL;
+		int always_use = FINDVAR_FOR_PSEUDO_ARRAY(output_var);
 		if (   !(var = g_script.FindOrAddVar(var_name
 			, sntprintf(var_name, _countof(var_name), _T("%sX"), output_var.mName)
 			, always_use))   )
@@ -1738,7 +1744,8 @@ void GuiType::DestroyIconsIfUnused(HICON ahIcon, HICON ahIconSmall)
 	// authorized us to destroy it.
 	DestroyIcon(ahIcon);
 	// L17: Small icon should always also be unused at this point.
-	DestroyIcon(ahIconSmall);
+	if (ahIconSmall != ahIcon)
+		DestroyIcon(ahIconSmall);
 }
 
 
@@ -4550,11 +4557,13 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 	COLORREF &color_main = (aControl.type == GUI_CONTROL_LISTVIEW || aControl.type == GUI_CONTROL_PIC)
 		? aOpt.color_listview : aControl.union_color;
 	LPTSTR next_option, option_end;
+	LPTSTR error_message; // Used by "return_error:" when aControl.hwnd == NULL.
 	TCHAR orig_char;
 	bool adding; // Whether this option is being added (+) or removed (-).
 	GuiControlType *tab_control;
 	RECT rect;
 	POINT pt;
+	bool do_invalidate_rect = false; // Set default.
 
 	for (next_option = aOptions; *next_option; next_option = omit_leading_whitespace(option_end))
 	{
@@ -5000,12 +5009,13 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 				aOpt.style_add |= ES_PASSWORD;
 				if (aControl.hwnd) // Update the existing edit.
 				{
-					// Don't know how to achieve the black circle on XP *after* the control has
-					// been created.  Maybe it's impossible.  Thus, provide default since otherwise
-					// pass-char will be removed vs. added:
+					// Provide default since otherwise pass-char will be removed vs. added.
+					// The encoding of the message's parameter depends on whether SendMessageW or SendMessageA is called.
+					// 9679 corresponds to the default bullet character on XP and later (verified with EM_GETPASSWORDCHAR).
 					if (!aOpt.password_char)
-						aOpt.password_char = '*';
-					SendMessage(aControl.hwnd, EM_SETPASSWORDCHAR, (WPARAM)aOpt.password_char, 0);
+						SendMessageW(aControl.hwnd, EM_SETPASSWORDCHAR, (g_os.IsWinXPorLater() ? 9679 : '*'), 0);
+					else
+						SendMessage(aControl.hwnd, EM_SETPASSWORDCHAR, (WPARAM)aOpt.password_char, 0);
 				}
 			}
 			else
@@ -5014,6 +5024,9 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 				if (aControl.hwnd) // Update the existing edit.
 					SendMessage(aControl.hwnd, EM_SETPASSWORDCHAR, 0, 0);
 			}
+			// Despite what MSDN seems to say, the control is not redrawn when the EM_SETPASSWORDCHAR
+			// message is received.  This is required for the control to visibly update immediately:
+			do_invalidate_rect = true;
 		}
 		else if (!_tcsnicmp(next_option, _T("Limit"), 5)) // This is used for Hotkey controls also.
 		{
@@ -5067,10 +5080,13 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 			if (adding) aOpt.style_add |= TBS_NOTICKS; else aOpt.style_remove |= TBS_NOTICKS;
 		else if (aControl.type == GUI_CONTROL_SLIDER && !_tcsnicmp(next_option, _T("TickInterval"), 12))
 		{
+			aOpt.tick_interval_changed = true;
 			if (adding)
 			{
 				aOpt.style_add |= TBS_AUTOTICKS;
-				aOpt.tick_interval = ATOI(next_option + 12);
+				next_option += 12;
+				aOpt.tick_interval_specified = *next_option;
+				aOpt.tick_interval = ATOI(next_option);
 			}
 			else
 			{
@@ -5246,7 +5262,10 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 			// Retrieve the class atom (http://blogs.msdn.com/b/oldnewthing/archive/2004/10/11/240744.aspx)
 			aOpt.customClassAtom = (ATOM) GetClassInfoEx(g_hInstance, className, &wc);
 			if (aOpt.customClassAtom == 0)
-				return g_script.ScriptError(_T("Unregistered window class."), className);
+			{
+				g_script.ScriptError(_T("Unregistered window class."), className);
+				goto return_fail;
+			}
 		}
 
 		// Styles (alignment/justification):
@@ -5573,7 +5592,8 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 					break;
 				default:
 					// v1.1.04: Validate Gui options.
-					return g_script.ScriptError(ERR_INVALID_OPTION, next_option-1);
+					g_script.ScriptError(ERR_INVALID_OPTION, next_option-1);
+					goto return_fail;
 				}
 				*option_end = orig_char; // Undo the temporary termination because the caller needs aOptions to be unaltered.
 				continue;
@@ -5588,11 +5608,12 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 				// no support click-detection anyway, even if the BS_NOTIFY style is given to them
 				// (this has been verified twice):
 				if (aControl.type == GUI_CONTROL_GROUPBOX || aControl.type == GUI_CONTROL_PROGRESS)
+				{
 					// If control's hwnd exists, we were called from a caller who wants ErrorLevel set
 					// instead of a message displayed:
-					return aControl.hwnd ? g_script.SetErrorLevelOrThrow()
-						: g_script.ScriptError(_T("This control type should not have an associated subroutine.")
-							, next_option - 1);
+					error_message = _T("This control type should not have an associated subroutine.");
+					goto return_error;
+				}
 				IObject *candidate_label;
 				if (   !(candidate_label = g_script.FindCallable(next_option, aParam3Var, 4))   )
 				{
@@ -5606,8 +5627,10 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 					//else if (!_tcsicmp(label_name, "Clear")) -->
 					//	control.options |= GUI_CONTROL_ATTRIB_IMPLICIT_CLEAR;
 					else // Since a non-special label was explicitly specified, it's an error that it can't be found.
-						return aControl.hwnd ? g_script.SetErrorLevelOrThrow()
-							: g_script.ScriptError(ERR_NO_LABEL, next_option - 1);
+					{
+						error_message = ERR_NO_LABEL;
+						goto return_error;
+					}
 				}
 				if (aControl.type == GUI_CONTROL_TEXT || aControl.type == GUI_CONTROL_PIC)
 					// Apply the SS_NOTIFY style *only* if the control actually has an associated action.
@@ -5637,7 +5660,7 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 					// all those functions to have a silent mode doesn't seem worth the trouble given how
 					// rarely 1) a control needs to get a new variable; 2) that variable name is too long
 					// or not valid.
-					return FAIL;  // It already displayed the error (e.g. name too long). Existing var (if any) is retained.
+					goto return_fail;  // It already displayed the error (e.g. name too long). Existing var (if any) is retained.
 				// Below: Must be a global variable since otherwise, "Gui Submit" would store its results
 				// in the local variables of some function that isn't even currently running.  Reporting
 				// a runtime error seems the best way to solve this overall issue since the other
@@ -5651,7 +5674,10 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 				// that they point to the global instead.  But that is pretty ugly and doesn't seem worth it.
 				candidate_var = candidate_var->ResolveAlias(); // Update it to its target if it's an alias.  This might be relied upon by Gui::FindControl() and other things, and also the section below.
 				if (candidate_var->IsNonStaticLocal()) // Note that an alias can point to a local vs. global var.
-					return g_script.ScriptError(_T("A control's variable must be global or static."), next_option - 1);
+				{
+					g_script.ScriptError(_T("A control's variable must be global or static."), next_option - 1);
+					goto return_fail;
+				}
 				// Another reason that the above always resolves aliases is because it allows the next
 				// check below to find true duplicates, even if different aliases are used to create the
 				// controls (i.e. if two alias both point to the same global).
@@ -5665,9 +5691,10 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 				GuiIndexType u;
 				for (u = 0; u < mControlCount; ++u)
 					if (mControl[u].output_var == candidate_var)
-						return aControl.hwnd ? g_script.SetErrorLevelOrThrow()
-							: g_script.ScriptError(_T("The same variable cannot be used for more than one control.") // It used to say "one control per window" but that seems more confusing than it's worth.
-								, next_option - 1);
+					{
+						error_message = _T("The same variable cannot be used for more than one control."); // It used to say "one control per window" but that seems more confusing than it's worth.
+						goto return_error;
+					}
 				aControl.output_var = candidate_var;
 				break;
 
@@ -5828,12 +5855,24 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
 					break;
 				}
 				// v1.1.04: Validate Gui options.
-				return g_script.ScriptError(ERR_INVALID_OPTION, next_option-1);
+				g_script.ScriptError(ERR_INVALID_OPTION, next_option-1);
+				goto return_fail;
 			} // switch()
 		} // Final "else" in the "else if" ladder.
 
 		*option_end = orig_char; // Undo the temporary termination because the caller needs aOptions to be unaltered.
-
+		continue;
+	// These "subroutines" are used to reduce code size and ensure the temporary termination is undone even on failure:
+	return_fail:
+		*option_end = orig_char; // See above.
+		return FAIL;
+	return_error:
+		// Although it's tempting to undo the termination *after* showing the error (so that only the bad option
+		// is shown), that would cause the options parameter to appear truncated in the error line text, unless
+		// the parameter contains variables, since aOptions does not point to the arg text in that case.
+		*option_end = orig_char; // See above.
+		return aControl.hwnd ? g_script.SetErrorLevelOrThrow()
+						: g_script.ScriptError(error_message, next_option - 1);
 	} // for() each item in option list
 
 	// If the control has already been created, apply the new style and exstyle here, if any:
@@ -6101,7 +6140,8 @@ ResultType GuiType::ControlParseOptions(LPTSTR aOptions, GuiControlOptionsType &
   		// Redrawing the controls is required in some cases, such as a checkbox losing its 3-state
 		// style while it has a gray checkmark in it (which incidentally in this case only changes
 		// the appearance of the control, not the internal stored value in this case).
-		bool do_invalidate_rect = style_needed_changing && style_change_ok; // Set default.
+		if (style_needed_changing && style_change_ok)
+			do_invalidate_rect = true;
 
 		// Do the below only after applying the styles above since part of it requires that the style be
 		// updated and applied above.
@@ -6810,14 +6850,18 @@ ResultType GuiType::Show(LPTSTR aOptions, LPTSTR aText)
 		height = rect.bottom - rect.top; // rect.top might be slightly less than zero. A status bar is properly handled since it's inside the window's client area.
 
 		RECT work_rect;
-		SystemParametersInfo(SPI_GETWORKAREA, 0, &work_rect, 0);  // Get desktop rect excluding task bar.
+		bool is_child_window = mOwner && (style & WS_CHILD);
+		if (is_child_window)
+			GetClientRect(mOwner, &work_rect); // Center within parent window (our position is set relative to mOwner's client area, not in screen coordinates).
+		else
+			SystemParametersInfo(SPI_GETWORKAREA, 0, &work_rect, 0);  // Get desktop rect excluding task bar.
 		int work_width = work_rect.right - work_rect.left;  // Note that "left" won't be zero if task bar is on left!
 		int work_height = work_rect.bottom - work_rect.top; // Note that "top" won't be zero if task bar is on top!
 
 		// Seems best to restrict window size to the size of the desktop whenever explicit sizes
 		// weren't given, since most users would probably want that.  But only on first use of
 		// "Gui Show" (even "Gui, Show, Hide"):
-		if (mGuiShowHasNeverBeenDone)
+		if (mGuiShowHasNeverBeenDone && !is_child_window)
 		{
 			if (width_orig == COORD_UNSPECIFIED && width > work_width)
 				width = work_width;
@@ -6827,12 +6871,8 @@ ResultType GuiType::Show(LPTSTR aOptions, LPTSTR aText)
 
 		if (x == COORD_CENTERED || y == COORD_CENTERED) // Center it, based on its dimensions determined above.
 		{
-			// This does not currently handle multi-monitor systems explicitly, since those calculations
-			// require API functions that don't exist in Win95/NT (and thus would have to be loaded
-			// dynamically to allow the program to launch).  Therefore, windows will likely wind up
-			// being centered across the total dimensions of all monitors, which usually results in
-			// half being on one monitor and half in the other.  This doesn't seem too terrible and
-			// might even be what the user wants in some cases (i.e. for really big windows).
+			// This does not handle multi-monitor systems explicitly, and has no need to do so since
+			// SPI_GETWORKAREA "Retrieves the size of the work area on the primary display monitor".
 			if (x == COORD_CENTERED)
 				x = work_rect.left + ((work_width - width) / 2);
 			if (y == COORD_CENTERED)
@@ -7660,9 +7700,6 @@ int GuiType::FindOrCreateFont(LPTSTR aOptions, LPTSTR aFontName, FontType *aFoun
 		{
 			// For simplifying other code sections, create an entry in the array for the default font
 			// (GUI constructor relies on at least one font existing in the array).
-			if (!sFont) // v1.0.44.14: Created upon first use to conserve ~14 KB memory in non-GUI scripts.
-				if (   !(sFont = (FontType *)malloc(sizeof(FontType) * MAX_GUI_FONTS))   )
-					g_script.ExitApp(EXIT_CRITICAL, ERR_OUTOFMEM); // Since this condition is so rare, just abort to avoid the need to add extra logic in several places to detect a failed/NULL array.
 			// Doesn't seem likely that DEFAULT_GUI_FONT face/size will change while a script is running,
 			// or even while the system is running for that matter.  I think it's always an 8 or 9 point
 			// font regardless of desktop's appearance/theme settings.
@@ -9307,6 +9344,7 @@ LRESULT GuiType::CustomCtrlWmNotify(GuiIndexType aControlIndex, LPNMHDR aNmHdr)
 		returnValue = (INT_PTR)g_ErrorLevel->ToInt64(FALSE);
 
 	Release();
+	g->GuiWindow = NULL;
 	ResumeUnderlyingThread(ErrorLevel_saved);
 
 	return returnValue;
@@ -9398,13 +9436,17 @@ LPTSTR GuiType::HotkeyToText(WORD aHotkey, LPTSTR aBuf)
 		// rather than SC.  Otherwise, Numlock will wind up being SC145 and NumpadDiv something similar.
 		// If a hotkey control could capture AppsKey, PrintScreen, Ctrl-Break (VK_CANCEL), which it can't, this
 		// would also apply to them.
-		sc_type sc1 = vk_to_sc(vk); // Primary scan code for this virtual key.
+		// Fix for v1.1.26.02: Check sc2 != 0, not sc1 != sc2, otherwise the fix described above doesn't work.
 		sc_type sc2 = vk_to_sc(vk, true); // Secondary scan code (will be the same as above if the VK has only one SC).
-		sc_type sc = (sc2 & 0x100) ? sc2 : sc1;
-		if ((sc & 0x100) && sc1 != sc2) // "sc" is both non-zero and extended, and this isn't a single-scan-code VK.
+		if (sc2) // Non-zero means this key has two scan codes.
 		{
-			SCtoKeyName(sc, cp, 100);
-			return aBuf;
+			sc_type sc1 = vk_to_sc(vk); // Primary scan code for this virtual key.
+			sc_type sc = (sc2 & 0x100) ? sc2 : sc1;
+			if (sc & 0x100)
+			{
+				SCtoKeyName(sc, cp, 100);
+				return aBuf;
+			}
 		}
 	}
 	// Since above didn't return, use a simple lookup on VK, since it gives preference to non-extended keys.
@@ -9541,12 +9583,21 @@ void GuiType::ControlSetSliderOptions(GuiControlType &aControl, GuiControlOption
 		SendMessage(aControl.hwnd, TBM_SETRANGEMIN, FALSE, aOpt.range_min); // No redraw
 		SendMessage(aControl.hwnd, TBM_SETRANGEMAX, TRUE, aOpt.range_max); // Redraw.
 	}
-	if (aOpt.tick_interval)
+	if (aOpt.tick_interval_changed)
 	{
 		if (aOpt.tick_interval < 0) // This is the signal to remove the existing tickmarks.
 			SendMessage(aControl.hwnd, TBM_CLEARTICS, TRUE, 0);
-		else // greater than zero, since zero itself it checked in one of the enclose IFs above.
+		else if (aOpt.tick_interval_specified)
 			SendMessage(aControl.hwnd, TBM_SETTICFREQ, aOpt.tick_interval, 0);
+		else
+			// +TickInterval without a value.  TBS_AUTOTICKS was added, but doesn't take effect
+			// until TBM_SETRANGE' or TBM_SETTICFREQ is sent.  Since the script might have already
+			// set an interval and there's no TBM_GETTICFREQ, use TBM_SETRANGEMAX to set the ticks.
+			if (!aOpt.range_changed) // TBM_SETRANGEMAX wasn't already sent.
+			{
+				SendMessage(aControl.hwnd, TBM_SETRANGEMAX, TRUE
+					, SendMessage(aControl.hwnd, TBM_GETRANGEMAX, 0, 0));
+			}
 	}
 	if (aOpt.line_size > 0) // Removal is not supported, so only positive values are considered.
 		SendMessage(aControl.hwnd, TBM_SETLINESIZE, 0, aOpt.line_size);
@@ -9778,8 +9829,15 @@ void GuiType::ControlUpdateCurrentTab(GuiControlType &aTabControl, bool aFocusFi
 	// ShowWindow(), EnableWindow() apparently does not cause a repaint to occur.
 	// Fix for v1.0.25.14: Don't send the message below (and its counterpart later on) because that
 	// sometimes or always, as a side-effect, shows the window if it's hidden:
+	// Fix for v1.1.27.07: WM_SETREDRAW appears to have the effect of clearing the update region
+	// (causing any pending redraw, such as by a previous call to this function for a different tab
+	// control, to be discarded).  To work around this, save the current update region.
+	RECT update_rect = {0}; // For simplicity, use GetUpdateRect() vs GetUpdateRgn().
 	if (parent_is_visible_and_not_minimized)
+	{
+		GetUpdateRect(mHwnd, &update_rect, FALSE);
 		SendMessage(mHwnd, WM_SETREDRAW, FALSE, 0);
+	}
 	bool invalidate_entire_parent = false; // Set default.
 
 	// Even if mHwnd is hidden, set styles to Show/Hide and Enable/Disable any controls that need it.
@@ -9892,6 +9950,12 @@ void GuiType::ControlUpdateCurrentTab(GuiControlType &aTabControl, bool aFocusFi
 			InvalidateRect(mHwnd, NULL, TRUE); // TRUE seems safer.
 		else
 		{
+			if (update_rect.left != update_rect.right)
+				// Reset the window's update region, which was likely cleared by WM_SETREDRAW.
+				// Doing this separately to tab_rect might perform better than using UnionRect(),
+				// which could cover a much larger area than necessary.  The system should handle
+				// the case where the two rects overlap (i.e. there won't be redundant repainting).
+				InvalidateRect(mHwnd, &update_rect, TRUE);
 			MapWindowPoints(NULL, mHwnd, (LPPOINT)&tab_rect, 2); // Convert rect to client coordinates (not the same as GetClientRect()).
 			InvalidateRect(mHwnd, &tab_rect, TRUE); // Seems safer to use TRUE, not knowing all possible overlaps, etc.
 		}
@@ -10291,7 +10355,8 @@ INT_PTR CALLBACK TabDialogProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			if (   uMsg == WM_CTLCOLORSTATIC
 				&& (TABDIALOG_ATTRIB_THEMED & GetWindowLongPtr(hDlg, GWLP_USERDATA))
 				&& (pcontrol = pgui->FindControl((HWND)lParam))
-				&& !(pcontrol->attrib & GUI_CONTROL_ATTRIB_BACKGROUND_TRANS)   )
+				&& !(pcontrol->attrib & GUI_CONTROL_ATTRIB_BACKGROUND_TRANS)
+				&& MyIsAppThemed()   )
 			{
 				HDC hdc = (HDC)wParam;
 				HBRUSH brush = (HBRUSH)GetProp(hDlg, _T("br"));

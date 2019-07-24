@@ -152,8 +152,18 @@ ResultType Script::PerformMenu(LPTSTR aMenu, LPTSTR aCommand, LPTSTR aParam3, LP
 				// L17: For best results, load separate small and large icons.
 				HICON new_icon_small;
 				HICON new_icon = NULL; // Initialize to detect failure to load either icon.
-				if ( new_icon_small = (HICON)LoadPicture(aParam3, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), image_type, icon_number, false) ) // Called with icon_number > 0, it guarantees return of an HICON/HCURSOR, never an HBITMAP.
-					if ( !(new_icon = (HICON)LoadPicture(aParam3, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), image_type, icon_number, false)) )
+				HMODULE icon_module = NULL; // Must initialize because it's not always set by LoadPicture().
+				if (!_tcsnicmp(aParam3, _T("HICON:"), 6) && aParam3[6] != '*')
+				{
+					// Handle this here rather than in LoadPicture() because the first call would destroy the
+					// original icon (due to specifying the width and height), causing the second call to fail.
+					// Keep the original size for both icons since that sometimes produces better results than
+					// CopyImage(), and it keeps the code smaller.
+					new_icon_small = (HICON)(UINT_PTR)ATOI64(aParam3 + 6);
+					new_icon = new_icon_small; // DestroyIconsIfUnused() handles this case by calling DestroyIcon() only once.
+				}
+				else if ( new_icon_small = (HICON)LoadPicture(aParam3, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), image_type, icon_number, false) ) // Called with icon_number > 0, it guarantees return of an HICON/HCURSOR, never an HBITMAP.
+					if ( !(new_icon = (HICON)LoadPicture(aParam3, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), image_type, icon_number, false, NULL, &icon_module)) )
 						DestroyIcon(new_icon_small);
 				if ( !new_icon )
 					RETURN_MENU_ERROR(_T("Can't load icon."), aParam3);
@@ -169,14 +179,21 @@ ResultType Script::PerformMenu(LPTSTR aMenu, LPTSTR aCommand, LPTSTR aParam3, LP
 					mCustomIconFile = (LPTSTR) SimpleHeap::Malloc(MAX_PATH * sizeof(TCHAR));
 				if (mCustomIconFile)
 				{
+					TCHAR full_path[MAX_PATH], *filename_marker;
+					// If the icon was loaded from a DLL, relative->absolute conversion below may produce the
+					// wrong result (i.e. in the typical case where the DLL is not in the working directory).
+					// So in that case, get the path of the module which contained the icon (if available).
 					// Get the full path in case it's a relative path.  This is documented and it's done in case
 					// the script ever changes its working directory:
-					TCHAR full_path[MAX_PATH], *filename_marker;
-					if (GetFullPathName(aParam3, _countof(full_path) - 1, full_path, &filename_marker))
+					if (   icon_module && GetModuleFileName(icon_module, full_path, _countof(full_path))
+						|| GetFullPathName(aParam3, _countof(full_path) - 1, full_path, &filename_marker)   )
 						tcslcpy(mCustomIconFile, full_path, MAX_PATH);
 					else
 						tcslcpy(mCustomIconFile, aParam3, MAX_PATH);
 				}
+
+				if (icon_module)
+					FreeLibrary(icon_module);
 
 				if (!g_NoTrayIcon)
 					UpdateTrayIcon(true);  // Need to use true in this case too.
@@ -538,9 +555,8 @@ ResultType Script::ScriptDeleteMenu(UserMenu *aMenu)
 		aMenu_prev->mNextMenu = aMenu->mNextMenu; // Can be NULL if aMenu was the last one.
 	else // aMenu was the first one in the list.
 		mFirstMenu = aMenu->mNextMenu; // Can be NULL if the list will now be empty.
-	// Do this last when its contents are no longer needed.  Its destructor will delete all
-	// the items in the menu and destroy the OS menu itself:
-	aMenu->DeleteAllItems(); // This also calls Destroy() to free the menu's resources.
+	aMenu->Destroy(); // Destroy the OS menu.
+	aMenu->DeleteAllItems();
 	if (aMenu->mBrush) // Free the brush used for the menu's background color.
 		DeleteObject(aMenu->mBrush);
 	free(aMenu->mName); // Since it was separately allocated.
@@ -635,7 +651,7 @@ UserMenuItem *UserMenu::FindItem(LPTSTR aNameOrPos, UserMenuItem *&aPrevItem, bo
 
 
 
-// Macros for use with the below methods:
+// Macros for use with the below methods (in previous versions, submenus were identified by position):
 #define aMenuItem_ID		aMenuItem->mMenuID
 #define aMenuItem_MF_BY		MF_BYCOMMAND
 #define UPDATE_GUI_MENU_BARS(menu_type, hmenu) \
@@ -807,27 +823,20 @@ ResultType UserMenu::DeleteItem(UserMenuItem *aMenuItem, UserMenuItem *aMenuItem
 
 
 ResultType UserMenu::DeleteAllItems()
+// Remove all menu items from the linked list and from the menu.
 {
+	// Fixed for v1.1.27.03: Don't attempt to take a shortcut by calling Destroy(), as it
+	// will fail if this is a sub-menu of a menu bar.  Removing the items individually will
+	// do exactly what the user expects.  The following old comment indicates one reason
+	// Destroy() was used; that reason is now obsolete since submenus are given IDs:
+	// "In addition, this avoids the need to find any submenus by position:"
 	if (!mFirstMenuItem)
 		return OK;  // If there are no user-defined menu items, it's already in the correct state.
-	// Remove all menu items from the linked list and from the menu.  First destroy the menu since
-	// it's probably better to start off fresh than have the destructor individually remove each
-	// menu item as the items in the linked list are deleted.  In addition, this avoids the need
-	// to find any submenus by position:
-	if (!Destroy())  // if mStandardMenuItems is true, the menu will be recreated later when needed.
-		// If menu can't be destroyed, it's probably due to it being attached as a menu bar to an existing
-		// GUI window.  In this case, when the window is destroyed, the menu bar will be too, so it's
-		// probably best to do nothing.  If we were called as a result of "menu, MenuName, Delete", it
-		// is documented that this will fail in this case.
-		return FAIL;
-	// The destructor relies on the fact that the above destroys the menu but does not recreate it.
-	// This is because popup menus, not being affiliated with a window (unless they're attached to
-	// a menu bar, but that isn't the case with our GUI windows, which detach such menus prior to
-	// when the GUI window is destroyed in case the menu is in use by another window), must be
-	// destroyed with DestroyMenu() to ensure a clean exit (resources freed).
 	UserMenuItem *menu_item_to_delete;
 	for (UserMenuItem *mi = mFirstMenuItem; mi;)
 	{
+		if (mMenu)
+			RemoveMenu(mMenu, mi->mMenuID, MF_BYCOMMAND);
 		menu_item_to_delete = mi;
 		mi = mi->mNextMenuItem;
 		if (g_script.mThisMenuItem == menu_item_to_delete)
@@ -840,6 +849,7 @@ ResultType UserMenu::DeleteAllItems()
 	mFirstMenuItem = mLastMenuItem = NULL;
 	mMenuItemCount = 0;
 	mDefault = NULL;  // i.e. there can't be a *user-defined* default item anymore, even if this is the tray.
+	UPDATE_GUI_MENU_BARS(mMenuType, mMenu)  // Verified as being necessary.
 	return OK;
 }
 
@@ -993,10 +1003,6 @@ ResultType UserMenu::RenameItem(UserMenuItem *aMenuItem, LPTSTR aNewName)
 
 	if (*aNewName)
 	{
-		// Names must be unique only within each menu:
-		for (UserMenuItem *mi = mFirstMenuItem; mi; mi = mi->mNextMenuItem)
-			if (!lstrcmpi(mi->mName, aNewName)) // Match found (case insensitive).
-				return FAIL; // Caller should display an error message.
 		if (aMenuItem->mMenuType & MFT_SEPARATOR)
 		{
 			// Since this item is currently a separator, the system will have disabled it.
@@ -1139,7 +1145,7 @@ ResultType UserMenu::SetDefault(UserMenuItem *aMenuItem)
 	if (!mMenu) // No further action required: the new setting will be in effect when the menu is created.
 		return OK;
 	if (aMenuItem) // A user-defined menu item is being made the default.
-		SetMenuDefaultItem(mMenu, aMenuItem_ID, aMenuItem->mSubmenu != NULL); // This also ensures that only one is default at a time.
+		SetMenuDefaultItem(mMenu, aMenuItem->mMenuID, FALSE); // This also ensures that only one is default at a time.
 	else
 	{
 		// Otherwise, a user-defined item that was previously the default is no longer the default.
@@ -1180,7 +1186,15 @@ ResultType UserMenu::ExcludeStandardItems()
 	if (!mIncludeStandardItems)
 		return OK;
 	mIncludeStandardItems = false;
-	return Destroy(); // It will be recreated automatically the next time the user displays it.
+	// This method isn't used because it fails on sub-menus of a menu bar:
+	//return Destroy(); // It will be recreated automatically the next time the user displays it.
+	if (mMenu)
+	{
+		for (UINT i = ID_TRAY_FIRST; i <= ID_TRAY_LAST; ++i)
+			RemoveMenu(mMenu, i, MF_BYCOMMAND);
+		UPDATE_GUI_MENU_BARS(mMenuType, mMenu)  // Verified as being necessary (though it's unusual to put the standard items on a menu bar).
+	}
+	return OK;
 }
 
 
@@ -1313,11 +1327,11 @@ ResultType UserMenu::AppendStandardItems()
 #else
 	AppendMenu(mMenu, MF_STRING, ID_TRAY_OPEN, _T("&Open"));
 	AppendMenu(mMenu, MF_STRING, ID_TRAY_HELP, _T("&Help"));
-	AppendMenu(mMenu, MF_SEPARATOR, 0, NULL);
+	AppendMenu(mMenu, MF_SEPARATOR, ID_TRAY_SEP1, NULL); // The separators are given IDs to simplify removal.
 	AppendMenu(mMenu, MF_STRING, ID_TRAY_WINDOWSPY, _T("&Window Spy"));
 	AppendMenu(mMenu, MF_STRING, ID_TRAY_RELOADSCRIPT, _T("&Reload This Script"));
 	AppendMenu(mMenu, MF_STRING, ID_TRAY_EDITSCRIPT, _T("&Edit This Script"));
-	AppendMenu(mMenu, MF_SEPARATOR, 0, NULL);
+	AppendMenu(mMenu, MF_SEPARATOR, ID_TRAY_SEP2, NULL);
 	if (this == g_script.mTrayMenu && !mDefault) // No user-defined default menu item, so use the standard one.
 		SetMenuDefaultItem(mMenu, ID_TRAY_OPEN, FALSE); // Seems to have no function other than appearance.
 #endif
@@ -1631,10 +1645,8 @@ ResultType UserMenu::SetItemIcon(UserMenuItem *aMenuItem, LPTSTR aFilename, int 
 	if (!*aFilename || (*aFilename == '*' && !aFilename[1]))
 		return RemoveItemIcon(aMenuItem);
 
-	// L29: The bitmap/icon returned by LoadPicture is converted to the appropriate format automatically,
-	// so the following is no longer necessary:
-	//if (aIconNumber == 0)
-	//	aIconNumber = 1; // Must be != 0 to tell LoadPicture that "icon must be loaded, never a bitmap".
+	if (aIconNumber == 0 && !g_os.IsWinVistaOrLater()) // The owner-draw method used on XP and older expects an icon.
+		aIconNumber = 1; // Must be != 0 to tell LoadPicture to return an icon, converting from bitmap if necessary.
 
 	int image_type;
 	HICON new_icon;
@@ -1646,7 +1658,7 @@ ResultType UserMenu::SetItemIcon(UserMenuItem *aMenuItem, LPTSTR aFilename, int 
 
 	if (g_os.IsWinVistaOrLater())
 	{
-		if (image_type == IMAGE_ICON) // Convert to 32-bit bitmap:
+		if (image_type != IMAGE_BITMAP) // Convert to 32-bit bitmap:
 		{
 			new_copy = IconToBitmap32(new_icon, true);
 			// Even if conversion failed, we have no further use for the icon:
@@ -1661,20 +1673,7 @@ ResultType UserMenu::SetItemIcon(UserMenuItem *aMenuItem, LPTSTR aFilename, int 
 	}
 	else
 	{
-		if (image_type == IMAGE_BITMAP) // Convert to icon:
-		{
-			ICONINFO iconinfo;
-			iconinfo.fIcon = TRUE;
-			iconinfo.hbmMask = (HBITMAP)new_icon;
-			iconinfo.hbmColor = (HBITMAP)new_icon;
-			new_copy = (HBITMAP)CreateIconIndirect(&iconinfo);
-			// Even if conversion failed, we have no further use for the bitmap:
-			DeleteObject((HBITMAP)new_icon);
-			if (!new_copy)
-				return FAIL;
-			new_icon = (HICON)new_copy;
-		}
-
+		// LoadPicture already converted to icon if needed, due to aIconNumber > 0.
 		if (aMenuItem->mIcon) // Delete previous icon.
 			DestroyIcon(aMenuItem->mIcon);
 	}

@@ -124,6 +124,7 @@ EXTERN_G;
 #define SC_NUMPADMULT 0x037
 #define SC_NUMPADSUB 0x04A
 #define SC_NUMPADADD 0x04E
+#define SC_PAUSE 0x045
 
 // Note: A KeyboardProc() (hook) actually receives 0x36 for RSHIFT under both WinXP and Win98se, not 0x136.
 // All the below have been verified to be accurate under Win98se and XP (except rctrl and ralt in XP).
@@ -137,6 +138,7 @@ EXTERN_G;
 #define SC_RWIN 0x15C
 
 #define SC_APPSKEY 0x15D
+#define SC_PRINTSCREEN 0x137
 
 // UPDATE for v1.0.39: Changed sc_type to USHORT vs. UINT to save memory in structs such as sc_hotkey.
 // This saves 60K of memory in one place, and possibly there are other large savings too.
@@ -195,11 +197,11 @@ struct key_to_sc_type // Map key names to scan codes.
 enum KeyStateTypes {KEYSTATE_LOGICAL, KEYSTATE_PHYSICAL, KEYSTATE_TOGGLE}; // For use with GetKeyJoyState(), etc.
 enum KeyEventTypes {KEYDOWN, KEYUP, KEYDOWNANDUP};
 
-void SendKeys(LPTSTR aKeys, bool aSendRaw, SendModes aSendModeOrig, HWND aTargetWindow = NULL);
+void SendKeys(LPTSTR aKeys, SendRawModes aSendRaw, SendModes aSendModeOrig, HWND aTargetWindow = NULL);
 void SendKey(vk_type aVK, sc_type aSC, modLR_type aModifiersLR, modLR_type aModifiersLRPersistent
 	, int aRepeatCount, KeyEventTypes aEventType, modLR_type aKeyAsModifiersLR, HWND aTargetWindow
 	, int aX = COORD_UNSPECIFIED, int aY = COORD_UNSPECIFIED, bool aMoveOffset = false);
-void SendKeySpecial(TCHAR aChar, int aRepeatCount);
+void SendKeySpecial(TCHAR aChar, int aRepeatCount, modLR_type aModifiersLR);
 void SendASC(LPCTSTR aAscii);
 
 struct PlaybackEvent
@@ -256,6 +258,9 @@ LRESULT CALLBACK PlaybackProc(int aCode, WPARAM wParam, LPARAM lParam);
 #define KEY_IGNORE_LEVEL(LEVEL) (KEY_IGNORE_ALL_EXCEPT_MODIFIER - LEVEL)
 #define KEY_IGNORE_MIN KEY_IGNORE_LEVEL(SendLevelMax)
 #define KEY_IGNORE_MAX KEY_IGNORE // There are two extra values above KEY_IGNORE_LEVEL(0)
+// This is used to generate an Alt key-up event for the purpose of changing system state, but having the hook
+// block it from the active window to avoid unwanted side-effects:
+#define KEY_BLOCK_THIS (KEY_IGNORE + 1)
 
 
 // The default in the below is KEY_IGNORE_ALL_EXCEPT_MODIFIER, which causes standard calls to
@@ -272,6 +277,7 @@ LRESULT CALLBACK PlaybackProc(int aCode, WPARAM wParam, LPARAM lParam);
 //    to make the hotkey suffix match a different set of modifiers, the wrong hotkey would fire.
 void KeyEvent(KeyEventTypes aEventType, vk_type aVK, sc_type aSC = 0, HWND aTargetWindow = NULL
 	, bool aDoKeyDelay = false, DWORD aExtraInfo = KEY_IGNORE_ALL_EXCEPT_MODIFIER);
+void KeyEventMenuMask(KeyEventTypes aEventType, DWORD aExtraInfo = KEY_IGNORE_ALL_EXCEPT_MODIFIER);
 
 ResultType PerformClick(LPTSTR aOptions);
 void ParseClickOptions(LPTSTR aOptions, int &aX, int &aY, vk_type &aVK, KeyEventTypes &aEventType
@@ -331,6 +337,9 @@ modLR_type ConvertModifiers(mod_type aModifiers);
 mod_type ConvertModifiersLR(modLR_type aModifiersLR);
 LPTSTR ModifiersLRToText(modLR_type aModifiersLR, LPTSTR aBuf);
 
+DWORD GetFocusedCtrlThread(HWND *apControl = NULL, HWND aWindow = GetForegroundWindow());
+HKL GetFocusedKeybdLayout(HWND aWindow = GetForegroundWindow());
+
 #define LAYOUT_UNDETERMINED FAIL
 bool ActiveWindowLayoutHasAltGr();
 ResultType LayoutHasAltGr(HKL aLayout, ResultType aHasAltGr = LAYOUT_UNDETERMINED);
@@ -343,7 +352,8 @@ TCHAR VKtoChar(vk_type aVK, HKL aKeybdLayout = NULL);
 sc_type TextToSC(LPTSTR aText);
 vk_type TextToVK(LPTSTR aText, modLR_type *pModifiersLR = NULL, bool aExcludeThoseHandledByScanCode = false
 	, bool aAllowExplicitVK = true, HKL aKeybdLayout = GetKeyboardLayout(0));
-vk_type CharToVKAndModifiers(TCHAR aChar, modLR_type *pModifiersLR, HKL aKeybdLayout);
+vk_type CharToVKAndModifiers(TCHAR aChar, modLR_type *pModifiersLR, HKL aKeybdLayout, bool aEnableAZFallback = true);
+bool TextToVKandSC(LPTSTR aText, vk_type &aVK, sc_type &aSC, modLR_type *pModifiersLR = NULL, HKL aKeybdLayout = GetKeyboardLayout(0));
 vk_type TextToSpecial(LPTSTR aText, size_t aTextLength, KeyEventTypes &aEventTypem, modLR_type &aModifiersLR
 	, bool aUpdatePersistent);
 
